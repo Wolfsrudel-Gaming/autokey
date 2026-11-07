@@ -5,7 +5,7 @@ using System.Windows.Forms;
 
 namespace AutoKey
 {
-    /// <summary>Simuliert Tastendrücke über SendInput.</summary>
+    /// <summary>Simuliert Tastendrücke und Mausklicks über SendInput.</summary>
     internal static class KeySender
     {
         private static readonly int InputSize = Marshal.SizeOf(typeof(NativeMethods.INPUT));
@@ -17,7 +17,7 @@ namespace AutoKey
             if (ctrl) inputs.Add(Make(Keys.ControlKey, false, scanCode));
             if (alt) inputs.Add(Make(Keys.Menu, false, scanCode));
             if (shift) inputs.Add(Make(Keys.ShiftKey, false, scanCode));
-            inputs.Add(Make(key, false, scanCode));
+            inputs.Add(IsMouseButton(key) ? MakeMouse(key, false) : Make(key, false, scanCode));
             return Send(inputs);
         }
 
@@ -25,11 +25,70 @@ namespace AutoKey
         public static bool Up(Keys key, bool ctrl, bool alt, bool shift, bool scanCode)
         {
             var inputs = new List<NativeMethods.INPUT>(4);
-            inputs.Add(Make(key, true, scanCode));
+            inputs.Add(IsMouseButton(key) ? MakeMouse(key, true) : Make(key, true, scanCode));
             if (shift) inputs.Add(Make(Keys.ShiftKey, true, scanCode));
             if (alt) inputs.Add(Make(Keys.Menu, true, scanCode));
             if (ctrl) inputs.Add(Make(Keys.ControlKey, true, scanCode));
             return Send(inputs);
+        }
+
+        public static bool IsMouseButton(Keys key)
+        {
+            switch (key & Keys.KeyCode)
+            {
+                case Keys.LButton:
+                case Keys.RButton:
+                case Keys.MButton:
+                case Keys.XButton1:
+                case Keys.XButton2:
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
+        /// <summary>Mausklick an der aktuellen Mausposition.</summary>
+        private static NativeMethods.INPUT MakeMouse(Keys button, bool up)
+        {
+            uint flags;
+            uint data = 0;
+            switch (button & Keys.KeyCode)
+            {
+                case Keys.RButton:
+                    flags = up ? NativeMethods.MOUSEEVENTF_RIGHTUP : NativeMethods.MOUSEEVENTF_RIGHTDOWN;
+                    break;
+                case Keys.MButton:
+                    flags = up ? NativeMethods.MOUSEEVENTF_MIDDLEUP : NativeMethods.MOUSEEVENTF_MIDDLEDOWN;
+                    break;
+                case Keys.XButton1:
+                    flags = up ? NativeMethods.MOUSEEVENTF_XUP : NativeMethods.MOUSEEVENTF_XDOWN;
+                    data = NativeMethods.XBUTTON1;
+                    break;
+                case Keys.XButton2:
+                    flags = up ? NativeMethods.MOUSEEVENTF_XUP : NativeMethods.MOUSEEVENTF_XDOWN;
+                    data = NativeMethods.XBUTTON2;
+                    break;
+                default:
+                    flags = up ? NativeMethods.MOUSEEVENTF_LEFTUP : NativeMethods.MOUSEEVENTF_LEFTDOWN;
+                    break;
+            }
+
+            return new NativeMethods.INPUT
+            {
+                type = NativeMethods.INPUT_MOUSE,
+                U = new NativeMethods.InputUnion
+                {
+                    mi = new NativeMethods.MOUSEINPUT
+                    {
+                        dx = 0,
+                        dy = 0,
+                        mouseData = data,
+                        dwFlags = flags,
+                        time = 0,
+                        dwExtraInfo = IntPtr.Zero,
+                    },
+                },
+            };
         }
 
         private static bool Send(List<NativeMethods.INPUT> inputs)

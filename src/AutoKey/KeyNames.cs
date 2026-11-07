@@ -25,6 +25,11 @@ namespace AutoKey
         private static readonly Dictionary<Keys, string> Names = new Dictionary<Keys, string>
         {
             { Keys.Space, "Leertaste" },
+            { Keys.LButton, "Maus links" },
+            { Keys.RButton, "Maus rechts" },
+            { Keys.MButton, "Maus Mitte" },
+            { Keys.XButton1, "Maus Seitentaste 1" },
+            { Keys.XButton2, "Maus Seitentaste 2" },
             { Keys.Enter, "Enter" },
             { Keys.Tab, "Tab" },
             { Keys.Escape, "Esc" },
@@ -68,6 +73,11 @@ namespace AutoKey
             get
             {
                 yield return Keys.Space;
+                yield return Keys.LButton;
+                yield return Keys.RButton;
+                yield return Keys.MButton;
+                yield return Keys.XButton1;
+                yield return Keys.XButton2;
                 yield return Keys.Enter;
                 yield return Keys.Tab;
                 yield return Keys.Escape;
@@ -113,6 +123,16 @@ namespace AutoKey
                 yield return Keys.Pause;
                 yield return Keys.Scroll;
             }
+        }
+
+        /// <summary>Taste mit Zusatztasten, z. B. "Strg+Shift+S".</summary>
+        public static string Describe(Keys key, bool ctrl, bool alt, bool shift)
+        {
+            string text = GetName(key);
+            if (shift) text = "Shift+" + text;
+            if (alt) text = "Alt+" + text;
+            if (ctrl) text = "Strg+" + text;
+            return text;
         }
 
         public static string GetName(Keys key)

@@ -1,6 +1,9 @@
 using System;
+using System.Collections.Generic;
 using System.Drawing;
+using System.Drawing.Drawing2D;
 using System.Globalization;
+using System.Linq;
 using System.Reflection;
 using System.Windows.Forms;
 
@@ -8,8 +11,19 @@ namespace AutoKey
 {
     internal sealed class MainForm : Form
     {
+        private enum Phase
+        {
+            Waiting,  // wartet auf den nächsten Durchlauf
+            Holding,  // Taste eines Schritts ist gedrückt
+            Gap,      // Pause zwischen zwei Schritten
+        }
+
         private const int HotkeyId = 0xA0C1;
         private const int MinIntervalMs = 20;
+        private const int ResumeDelayMs = 300; // kurze Pause, nachdem das Zielfenster wieder aktiv geworden ist
+        private const string NoProfile = "(kein Profil)";
+        private const string BlockedMessage =
+            "Windows hat die Eingabe blockiert. Läuft das Zielprogramm als Administrator? Dann AutoKey ebenfalls als Administrator starten.";
 
         private static readonly string AppVersion =
             Assembly.GetExecutingAssembly().GetName().Version.ToString(3);
@@ -20,27 +34,38 @@ namespace AutoKey
         private readonly Random random = new Random();
         private readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer { Interval = 10 };
         private readonly Icon appIcon;
+        private Icon trayIdleIcon, trayRunningIcon;
 
         // Oberfläche
-        private GroupBox grpKey, grpSchedule, grpOptions;
-        private ComboBox cmbKey, cmbUnit, cmbHotkey;
-        private Button btnCapture, btnStart, btnStop;
-        private CheckBox chkCtrl, chkAlt, chkShift, chkScanCode, chkStop, chkTopMost, chkTray, chkPreventSleep;
-        private NumericUpDown numHold, numInterval, numJitter, numRepeat, numDelay;
+        private ComboBox cmbProfile, cmbKey, cmbWindow, cmbMode, cmbUnit, cmbHotkey;
+        private Button btnProfileSave, btnProfileDelete, btnStepAdd, btnStepRemove, btnStepUp, btnStepDown;
+        private Button btnCapture, btnRefreshWindows, btnStart, btnStop;
+        private GroupBox grpSteps, grpTarget, grpSchedule, grpOptions;
+        private ListBox lstSteps;
+        private CheckBox chkCtrl, chkAlt, chkShift, chkScanCode, chkStop;
+        private CheckBox chkTopMost, chkTray, chkHideOnStart, chkNotify, chkPreventSleep;
+        private NumericUpDown numHold, numAfter, numInterval, numJitter, numRepeat, numDelay;
         private RadioButton rbDelay, rbTime;
         private DateTimePicker dtpStart, dtpStop;
         private Label lblStatus;
         private NotifyIcon tray;
         private ToolStripMenuItem trayToggle;
 
-        // Zustand
-        private bool running, holding, lastPressOk, capturing, hotkeyRegistered, closing;
-        private Keys runKey;
-        private bool runCtrl, runAlt, runShift, runScanCode;
+        // Bearbeitung
+        private readonly List<Step> steps = new List<Step>();
+        private bool updatingUi; // unterdrückt Ereignisse, während die Oberfläche per Code befüllt wird
+        private bool capturing, hotkeyRegistered, closing;
+
+        // Laufzustand
+        private bool running, paused, holdActive, lastPressOk;
+        private Step[] runSteps = new Step[0];
+        private bool runScanCode, runHoldMode;
+        private string runTarget = string.Empty;
         private double runIntervalMs;
-        private int runJitter, runHoldMs;
-        private long runRepeat, presses;
-        private DateTime nextDueUtc, releaseUtc;
+        private int runJitter, stepIndex;
+        private long runRepeat, presses, cycles;
+        private Phase phase;
+        private DateTime nextDueUtc, releaseUtc, gapUntilUtc, notBeforeUtc, holdSinceUtc, lastProcessCheckUtc;
         private DateTime? stopUtc;
         private string sendWarning;
         private string lastStatus = string.Empty, lastTrayText = string.Empty;
@@ -65,12 +90,13 @@ namespace AutoKey
             BuildUi();
             BuildTray();
             ApplySettingsToUi();
+            RefreshProfileList(settings.Profile);
 
             ResumeLayout(false);
             PerformLayout();
 
             timer.Tick += OnTick;
-            SetStatus("Bereit. Einstellungen wählen und auf Start klicken.");
+            SetStatus("Bereit. Ablauf zusammenstellen und auf Start klicken.");
         }
 
         // ------------------------------------------------------------------ Aufbau der Oberfläche
@@ -78,43 +104,109 @@ namespace AutoKey
         // bei höherer Bildschirmskalierung skaliert Windows Forms alles automatisch (AutoScaleMode.Dpi).
 
         private const int FieldX = 150;   // Spalte der Eingabefelder innerhalb einer Gruppe
-        private const int FirstRow = 24;  // erste Zeile unterhalb der Gruppenüberschrift
         private const int RowHeight = 30;
 
         private void BuildUi()
         {
-            const int formWidth = 480;
-            const int groupX = 10;
-            const int groupWidth = formWidth - 2 * groupX;
-            int y = 8;
+            const int colWidth = 440;
+            const int leftX = 10;
+            const int rightX = leftX + colWidth + 10;
+            const int formWidth = rightX + colWidth + 10;
+            const int top = 44;
 
-            // --- Welche Taste?
-            grpKey = NewGroup("Welche Taste?", groupX, y, groupWidth, FirstRow + 4 * RowHeight + 4);
+            // --- Profile
+            var lblProfile = new Label { Text = "Profil:", AutoSize = true, Location = new Point(12, 14) };
+            cmbProfile = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Location = new Point(60, 10), Width = 220 };
+            cmbProfile.SelectedIndexChanged += (s, e) => OnProfileSelected();
+            btnProfileSave = new Button { Text = "Speichern unter …", Location = new Point(288, 9), Size = new Size(130, 25) };
+            btnProfileSave.Click += (s, e) => SaveProfile();
+            btnProfileDelete = new Button { Text = "Löschen", Location = new Point(424, 9), Size = new Size(80, 25) };
+            btnProfileDelete.Click += (s, e) => DeleteProfile();
+            var lblProfileHint = new Label
+            {
+                Text = "Ein Profil pro Spiel/Aufgabe: speichert Ablauf, Zeitplan und Zielfenster.",
+                AutoSize = true,
+                ForeColor = SystemColors.GrayText,
+                Location = new Point(514, 14),
+            };
+
+            // --- Ablauf (linke Spalte)
+            grpSteps = NewGroup("Ablauf – die Schritte werden nacheinander ausgeführt", leftX, top, colWidth, 280);
+            lstSteps = new ListBox { Location = new Point(12, 24), Size = new Size(300, 124), IntegralHeight = false };
+            lstSteps.SelectedIndexChanged += (s, e) => { if (!updatingUi) LoadStepIntoEditor(); };
+            btnStepAdd = NewButton("+  Hinzufügen", 108, 320, 23, (s, e) => AddStep());
+            btnStepRemove = NewButton("–  Entfernen", 108, 320, 53, (s, e) => RemoveStep());
+            btnStepUp = NewButton("▲  Nach oben", 108, 320, 83, (s, e) => MoveStep(-1));
+            btnStepDown = NewButton("▼  Nach unten", 108, 320, 113, (s, e) => MoveStep(1));
+            grpSteps.Controls.AddRange(new Control[] { lstSteps, btnStepAdd, btnStepRemove, btnStepUp, btnStepDown });
+
             cmbKey = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 170, MaxDropDownItems = 20 };
             foreach (Keys k in KeyNames.CommonKeys) cmbKey.Items.Add(new KeyItem(k));
-            btnCapture = new Button { Text = "Aufnehmen …", Size = new Size(120, 25) };
+            btnCapture = new Button { Text = "Aufnehmen …", Size = new Size(100, 25) };
             btnCapture.Click += (s, e) => SetCapturing(!capturing);
             chkCtrl = NewCheck("Strg");
             chkAlt = NewCheck("Alt");
             chkShift = NewCheck("Shift");
-            numHold = NewNumber(1, 10_000, 70);
+            numHold = NewNumber(1, Step.MaxHoldMs, 80);
+            numAfter = NewNumber(0, Step.MaxDelayAfterMs, 80);
+
+            int y = 158;
+            AddLabel(grpSteps, "Taste / Maustaste:", y);
+            AddField(grpSteps, cmbKey, FieldX, y);
+            AddField(grpSteps, btnCapture, FieldX + 178, y);
+            y += RowHeight;
+            AddLabel(grpSteps, "Mit gedrückt:", y);
+            AddField(grpSteps, chkCtrl, FieldX, y);
+            AddField(grpSteps, chkAlt, FieldX + 60, y);
+            AddField(grpSteps, chkShift, FieldX + 115, y);
+            y += RowHeight;
+            AddLabel(grpSteps, "Haltedauer:", y);
+            AddField(grpSteps, numHold, FieldX, y);
+            AddNote(grpSteps, "ms", FieldX + 86, y);
+            y += RowHeight;
+            AddLabel(grpSteps, "Danach warten:", y);
+            AddField(grpSteps, numAfter, FieldX, y);
+            AddNote(grpSteps, "ms bis zum nächsten Schritt", FieldX + 86, y);
+
+            cmbKey.SelectedIndexChanged += (s, e) => OnEditorChanged();
+            chkCtrl.CheckedChanged += (s, e) => OnEditorChanged();
+            chkAlt.CheckedChanged += (s, e) => OnEditorChanged();
+            chkShift.CheckedChanged += (s, e) => OnEditorChanged();
+            numHold.ValueChanged += (s, e) => OnEditorChanged();
+            numAfter.ValueChanged += (s, e) => OnEditorChanged();
+
+            // --- Spiel / Zielfenster (linke Spalte)
+            grpTarget = NewGroup("Spiel / Zielfenster", leftX, grpSteps.Bottom + 8, colWidth, 122);
+            cmbWindow = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 244, MaxDropDownItems = 20 };
+            cmbWindow.Items.Add(WindowItem.Any);
+            cmbWindow.DropDown += (s, e) => RefreshWindowList();
+            btnRefreshWindows = new Button { Text = "↻", Size = new Size(30, 25) };
+            btnRefreshWindows.Click += (s, e) => RefreshWindowList();
+            new ToolTip().SetToolTip(btnRefreshWindows, "Liste der offenen Programme aktualisieren");
+            AddLabel(grpTarget, "Nur senden an:", 24);
+            AddField(grpTarget, cmbWindow, FieldX, 24);
+            AddField(grpTarget, btnRefreshWindows, FieldX + 248, 24);
+            grpTarget.Controls.Add(new Label
+            {
+                Text = "Pausiert automatisch, sobald ein anderes Fenster aktiv ist (z. B. nach Alt+Tab), "
+                       + "und stoppt, wenn das Programm beendet wird.",
+                Location = new Point(12, 56),
+                Size = new Size(416, 34),
+                ForeColor = SystemColors.GrayText,
+            });
             chkScanCode = NewCheck("Scancode senden (für Spiele empfohlen)");
+            chkScanCode.Location = new Point(12, 94);
+            grpTarget.Controls.Add(chkScanCode);
 
-            AddLabel(grpKey, "Taste:", 0);
-            AddField(grpKey, cmbKey, FieldX, 0);
-            AddField(grpKey, btnCapture, FieldX + 180, 0);
-            AddLabel(grpKey, "Mit gedrückt:", 1);
-            AddField(grpKey, chkCtrl, FieldX, 1);
-            AddField(grpKey, chkAlt, FieldX + 60, 1);
-            AddField(grpKey, chkShift, FieldX + 115, 1);
-            AddLabel(grpKey, "Haltedauer:", 2);
-            AddField(grpKey, numHold, FieldX, 2);
-            AddNote(grpKey, "Millisekunden", FieldX + 76, 2);
-            AddField(grpKey, chkScanCode, FieldX, 3);
-            y = grpKey.Bottom + 8;
-
-            // --- Wann?
-            grpSchedule = NewGroup("Wann?", groupX, y, groupWidth, FirstRow + 6 * RowHeight + 4);
+            // --- Wann? (rechte Spalte)
+            grpSchedule = NewGroup("Wann?", rightX, top, colWidth, 24 + 7 * RowHeight + 4);
+            cmbMode = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 270 };
+            cmbMode.Items.AddRange(new object[]
+            {
+                "Ablauf wiederholt ausführen",
+                "Tasten dauerhaft gedrückt halten (z. B. Laufen)",
+            });
+            cmbMode.SelectedIndexChanged += (s, e) => UpdateModeUi();
             numInterval = NewNumber(1, 1_000_000, 70);
             cmbUnit = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 115 };
             cmbUnit.Items.AddRange(new object[] { "Millisekunden", "Sekunden", "Minuten", "Stunden" });
@@ -128,78 +220,95 @@ namespace AutoKey
             chkStop = NewCheck("um");
             dtpStop = NewTimePicker();
 
-            AddLabel(grpSchedule, "Drücken alle:", 0);
-            AddField(grpSchedule, numInterval, FieldX, 0);
-            AddField(grpSchedule, cmbUnit, FieldX + 76, 0);
-            AddLabel(grpSchedule, "Zufällig variieren:", 1);
-            AddNote(grpSchedule, "±", FieldX, 1);
-            AddField(grpSchedule, numJitter, FieldX + 16, 1);
-            AddNote(grpSchedule, "%   (wirkt menschlicher)", FieldX + 77, 1);
-            AddLabel(grpSchedule, "Wiederholungen:", 2);
-            AddField(grpSchedule, numRepeat, FieldX, 2);
-            AddNote(grpSchedule, "(0 = unbegrenzt)", FieldX + 96, 2);
-            AddLabel(grpSchedule, "Erster Tastendruck:", 3);
-            AddField(grpSchedule, rbDelay, FieldX, 3);
-            AddField(grpSchedule, numDelay, FieldX + 55, 3);
-            AddNote(grpSchedule, "Sekunden nach dem Start", FieldX + 121, 3);
-            AddField(grpSchedule, rbTime, FieldX, 4);
-            AddField(grpSchedule, dtpStart, FieldX + 55, 4);
-            AddNote(grpSchedule, "Uhr", FieldX + 146, 4);
-            AddLabel(grpSchedule, "Automatisch stoppen:", 5);
-            AddField(grpSchedule, chkStop, FieldX, 5);
-            AddField(grpSchedule, dtpStop, FieldX + 55, 5);
-            AddNote(grpSchedule, "Uhr", FieldX + 146, 5);
-            y = grpSchedule.Bottom + 8;
+            y = 24;
+            AddLabel(grpSchedule, "Modus:", y);
+            AddField(grpSchedule, cmbMode, FieldX, y);
+            y += RowHeight;
+            AddLabel(grpSchedule, "Wiederholen alle:", y);
+            AddField(grpSchedule, numInterval, FieldX, y);
+            AddField(grpSchedule, cmbUnit, FieldX + 76, y);
+            y += RowHeight;
+            AddLabel(grpSchedule, "Zufällig variieren:", y);
+            AddNote(grpSchedule, "±", FieldX, y);
+            AddField(grpSchedule, numJitter, FieldX + 16, y);
+            AddNote(grpSchedule, "%", FieldX + 77, y);
+            y += RowHeight;
+            AddLabel(grpSchedule, "Wiederholungen:", y);
+            AddField(grpSchedule, numRepeat, FieldX, y);
+            AddNote(grpSchedule, "(0 = unbegrenzt)", FieldX + 96, y);
+            y += RowHeight;
+            AddLabel(grpSchedule, "Beginnen:", y);
+            AddField(grpSchedule, rbDelay, FieldX, y);
+            AddField(grpSchedule, numDelay, FieldX + 55, y);
+            AddNote(grpSchedule, "Sekunden nach dem Start", FieldX + 121, y);
+            y += RowHeight;
+            AddField(grpSchedule, rbTime, FieldX, y);
+            AddField(grpSchedule, dtpStart, FieldX + 55, y);
+            AddNote(grpSchedule, "Uhr", FieldX + 146, y);
+            y += RowHeight;
+            AddLabel(grpSchedule, "Automatisch stoppen:", y);
+            AddField(grpSchedule, chkStop, FieldX, y);
+            AddField(grpSchedule, dtpStop, FieldX + 55, y);
+            AddNote(grpSchedule, "Uhr", FieldX + 146, y);
 
-            // Die beiden Optionen liegen nicht im selben Container -> Gruppierung selbst übernehmen.
             rbDelay.CheckedChanged += (s, e) => { if (rbDelay.Checked) rbTime.Checked = false; };
             rbTime.CheckedChanged += (s, e) => { if (rbTime.Checked) rbDelay.Checked = false; };
             numDelay.ValueChanged += (s, e) => rbDelay.Checked = true;
             dtpStart.ValueChanged += (s, e) => rbTime.Checked = true;
             dtpStop.ValueChanged += (s, e) => chkStop.Checked = true;
 
-            // --- Optionen
-            grpOptions = NewGroup("Optionen", groupX, y, groupWidth, FirstRow + RowHeight + 3 * 26 + 6);
+            // --- Optionen (rechte Spalte)
+            grpOptions = NewGroup("Optionen", rightX, grpSchedule.Bottom + 8, colWidth, 24 + RowHeight + 5 * 24 + 6);
             cmbHotkey = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 90 };
             foreach (Keys k in KeyNames.HotkeyKeys) cmbHotkey.Items.Add(new KeyItem(k));
             cmbHotkey.SelectedIndexChanged += (s, e) => RegisterHotkey();
+            AddLabel(grpOptions, "Start/Stopp-Taste:", 24);
+            AddField(grpOptions, cmbHotkey, FieldX, 24);
+            AddNote(grpOptions, "(funktioniert auch im Spiel)", FieldX + 96, 24);
+
             chkTopMost = NewCheck("Fenster immer im Vordergrund");
             chkTopMost.CheckedChanged += (s, e) => TopMost = chkTopMost.Checked;
             chkTray = NewCheck("Beim Minimieren in den Infobereich (neben der Uhr)");
+            chkHideOnStart = NewCheck("Nach dem Start unsichtbar im Hintergrund weiterlaufen");
+            chkNotify = NewCheck("Benachrichtigungen anzeigen (z. B. „Fertig“)");
             chkPreventSleep = NewCheck("Standby verhindern, solange AutoKey läuft");
-
-            AddLabel(grpOptions, "Start/Stopp-Taste:", 0);
-            AddField(grpOptions, cmbHotkey, FieldX, 0);
-            AddNote(grpOptions, "(funktioniert in jedem Programm)", FieldX + 96, 0);
-            int optY = FirstRow + RowHeight;
-            foreach (CheckBox c in new[] { chkTopMost, chkTray, chkPreventSleep })
+            int optY = 24 + RowHeight;
+            foreach (CheckBox c in new[] { chkTopMost, chkTray, chkHideOnStart, chkNotify, chkPreventSleep })
             {
                 c.Location = new Point(12, optY);
                 grpOptions.Controls.Add(c);
-                optY += 26;
+                optY += 24;
             }
-            y = grpOptions.Bottom + 10;
+
+            // Unterkanten beider Spalten angleichen
+            int bottom = Math.Max(grpTarget.Bottom, grpOptions.Bottom);
+            grpTarget.Height = bottom - grpTarget.Top;
+            grpOptions.Height = bottom - grpOptions.Top;
 
             // --- Start / Stopp
-            int buttonWidth = (groupWidth - 10) / 2;
-            btnStart = new Button { Bounds = new Rectangle(groupX, y, buttonWidth, 38) };
+            y = bottom + 10;
+            btnStart = new Button { Bounds = new Rectangle(leftX, y, colWidth, 40) };
             btnStart.Font = new Font(Font, FontStyle.Bold);
             btnStart.Click += (s, e) => StartRun();
-            btnStop = new Button { Bounds = new Rectangle(groupX + buttonWidth + 10, y, buttonWidth, 38), Enabled = false };
+            btnStop = new Button { Bounds = new Rectangle(rightX, y, colWidth, 40), Enabled = false };
             btnStop.Click += (s, e) => StopRun("Gestoppt.");
             y = btnStart.Bottom + 8;
 
-            // --- Statusanzeige (zweizeilig, damit auch längere Hinweise ganz lesbar sind)
+            // --- Statusanzeige
             lblStatus = new Label
             {
-                Bounds = new Rectangle(groupX, y, groupWidth, 44),
+                Bounds = new Rectangle(leftX, y, formWidth - 2 * leftX, 40),
                 BorderStyle = BorderStyle.FixedSingle,
                 TextAlign = ContentAlignment.MiddleLeft,
                 Padding = new Padding(4, 0, 4, 0),
             };
             y = lblStatus.Bottom + 10;
 
-            Controls.AddRange(new Control[] { grpKey, grpSchedule, grpOptions, btnStart, btnStop, lblStatus });
+            Controls.AddRange(new Control[]
+            {
+                lblProfile, cmbProfile, btnProfileSave, btnProfileDelete, lblProfileHint,
+                grpSteps, grpTarget, grpSchedule, grpOptions, btnStart, btnStop, lblStatus,
+            });
             ClientSize = new Size(formWidth, y);
         }
 
@@ -213,9 +322,11 @@ namespace AutoKey
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("Beenden", null, (s, e) => Close());
 
+            trayIdleIcon = new Icon(appIcon, SystemInformation.SmallIconSize);
+            trayRunningIcon = CreateRunningIcon(trayIdleIcon);
             tray = new NotifyIcon
             {
-                Icon = new Icon(appIcon, SystemInformation.SmallIconSize),
+                Icon = trayIdleIcon,
                 Text = "AutoKey",
                 ContextMenuStrip = menu,
                 Visible = true,
@@ -223,24 +334,64 @@ namespace AutoKey
             tray.DoubleClick += (s, e) => RestoreFromTray();
         }
 
+        /// <summary>Symbol für den Infobereich mit grünem Punkt = „läuft“.</summary>
+        private static Icon CreateRunningIcon(Icon baseIcon)
+        {
+            try
+            {
+                using (Bitmap bitmap = baseIcon.ToBitmap())
+                using (Graphics g = Graphics.FromImage(bitmap))
+                using (var brush = new SolidBrush(Color.FromArgb(34, 197, 94)))
+                {
+                    g.SmoothingMode = SmoothingMode.AntiAlias;
+                    int d = Math.Max(6, bitmap.Width / 2);
+                    var dot = new Rectangle(bitmap.Width - d, bitmap.Height - d, d - 1, d - 1);
+                    g.FillEllipse(brush, dot);
+                    g.DrawEllipse(Pens.White, dot);
+
+                    IntPtr handle = bitmap.GetHicon();
+                    try
+                    {
+                        using (Icon temp = Icon.FromHandle(handle))
+                        {
+                            return (Icon)temp.Clone();
+                        }
+                    }
+                    finally
+                    {
+                        NativeMethods.DestroyIcon(handle);
+                    }
+                }
+            }
+            catch (Exception)
+            {
+                return baseIcon;
+            }
+        }
+
         private static GroupBox NewGroup(string title, int x, int y, int width, int height) =>
             new GroupBox { Text = title, Bounds = new Rectangle(x, y, width, height) };
 
-        private static int RowY(int row) => FirstRow + row * RowHeight;
-
         /// <summary>Beschriftung in der linken Spalte, vertikal an den Eingabefeldern ausgerichtet.</summary>
-        private static void AddLabel(Control parent, string text, int row) =>
-            parent.Controls.Add(new Label { Text = text, AutoSize = true, Location = new Point(12, RowY(row) + 4) });
+        private static void AddLabel(Control parent, string text, int y) =>
+            parent.Controls.Add(new Label { Text = text, AutoSize = true, Location = new Point(12, y + 4) });
 
         /// <summary>Kurzer Hinweistext hinter einem Eingabefeld.</summary>
-        private static void AddNote(Control parent, string text, int x, int row) =>
-            parent.Controls.Add(new Label { Text = text, AutoSize = true, Location = new Point(x, RowY(row) + 4) });
+        private static void AddNote(Control parent, string text, int x, int y) =>
+            parent.Controls.Add(new Label { Text = text, AutoSize = true, Location = new Point(x, y + 4) });
 
-        private static void AddField(Control parent, Control field, int x, int row)
+        private static void AddField(Control parent, Control field, int x, int y)
         {
             int offset = field is CheckBox || field is RadioButton ? 2 : field is Button ? -1 : 0;
-            field.Location = new Point(x, RowY(row) + offset);
+            field.Location = new Point(x, y + offset);
             parent.Controls.Add(field);
+        }
+
+        private static Button NewButton(string text, int width, int x, int y, EventHandler click)
+        {
+            var button = new Button { Text = text, Bounds = new Rectangle(x, y, width, 25), TextAlign = ContentAlignment.MiddleLeft };
+            button.Click += click;
+            return button;
         }
 
         private static CheckBox NewCheck(string text) => new CheckBox { Text = text, AutoSize = true };
@@ -275,43 +426,74 @@ namespace AutoKey
 
         private void ApplySettingsToUi()
         {
-            SelectKey(settings.Key);
-            chkCtrl.Checked = settings.Ctrl;
-            chkAlt.Checked = settings.Alt;
-            chkShift.Checked = settings.Shift;
-            SetNumber(numHold, settings.HoldMs);
-            chkScanCode.Checked = settings.ScanCode;
-
-            SetNumber(numInterval, settings.Interval);
-            cmbUnit.SelectedIndex = (int)settings.Unit;
-            SetNumber(numJitter, settings.JitterPercent);
-            SetNumber(numRepeat, settings.Repeat);
-            SetNumber(numDelay, settings.StartDelaySeconds);
-            dtpStart.Value = DateTime.Today + settings.StartTime;
-            dtpStop.Value = DateTime.Today + settings.StopTime;
-            if (settings.StartAtTime) rbTime.Checked = true; else rbDelay.Checked = true;
-            chkStop.Checked = settings.StopAtTime;
-
-            int hotkeyIndex = 0;
-            for (int i = 0; i < cmbHotkey.Items.Count; i++)
+            bool wasUpdating = updatingUi;
+            updatingUi = true;
+            try
             {
-                if (((KeyItem)cmbHotkey.Items[i]).Key == settings.Hotkey) hotkeyIndex = i;
+                ApplyTaskToUi();
+
+                int hotkeyIndex = 0;
+                for (int i = 0; i < cmbHotkey.Items.Count; i++)
+                {
+                    if (((KeyItem)cmbHotkey.Items[i]).Key == settings.Hotkey) hotkeyIndex = i;
+                }
+
+                cmbHotkey.SelectedIndex = hotkeyIndex;
+                chkTopMost.Checked = settings.TopMost;
+                chkTray.Checked = settings.MinimizeToTray;
+                chkHideOnStart.Checked = settings.HideOnStart;
+                chkNotify.Checked = settings.ShowNotifications;
+                chkPreventSleep.Checked = settings.PreventSleep;
             }
-            cmbHotkey.SelectedIndex = hotkeyIndex;
-            chkTopMost.Checked = settings.TopMost;
-            chkTray.Checked = settings.MinimizeToTray;
-            chkPreventSleep.Checked = settings.PreventSleep;
+            finally
+            {
+                updatingUi = wasUpdating;
+            }
+
             UpdateButtonTexts();
+        }
+
+        /// <summary>Ablauf, Zeitplan und Zielfenster in die Oberfläche übernehmen (auch beim Laden eines Profils).</summary>
+        private void ApplyTaskToUi()
+        {
+            bool wasUpdating = updatingUi;
+            updatingUi = true;
+            try
+            {
+                steps.Clear();
+                steps.AddRange(settings.Steps.Select(s => s.Clone()));
+                if (steps.Count == 0) steps.Add(new Step());
+                RefreshStepList(0);
+                LoadStepIntoEditor();
+
+                chkScanCode.Checked = settings.ScanCode;
+                RefreshWindowList(settings.TargetProcess);
+                cmbMode.SelectedIndex = settings.HoldMode ? 1 : 0;
+
+                SetNumber(numInterval, settings.Interval);
+                cmbUnit.SelectedIndex = (int)settings.Unit;
+                SetNumber(numJitter, settings.JitterPercent);
+                SetNumber(numRepeat, settings.Repeat);
+                SetNumber(numDelay, settings.StartDelaySeconds);
+                dtpStart.Value = DateTime.Today + settings.StartTime;
+                dtpStop.Value = DateTime.Today + settings.StopTime;
+                if (settings.StartAtTime) rbTime.Checked = true; else rbDelay.Checked = true;
+                chkStop.Checked = settings.StopAtTime;
+            }
+            finally
+            {
+                updatingUi = wasUpdating;
+            }
+
+            UpdateModeUi();
         }
 
         private void ReadSettingsFromUi()
         {
-            settings.Key = SelectedKey;
-            settings.Ctrl = chkCtrl.Checked;
-            settings.Alt = chkAlt.Checked;
-            settings.Shift = chkShift.Checked;
-            settings.HoldMs = (int)numHold.Value;
+            settings.Steps = steps.Select(s => s.Clone()).ToList();
             settings.ScanCode = chkScanCode.Checked;
+            settings.TargetProcess = SelectedTarget;
+            settings.HoldMode = HoldModeSelected;
 
             settings.Interval = (int)numInterval.Value;
             settings.Unit = (TimeUnit)Math.Max(0, cmbUnit.SelectedIndex);
@@ -326,7 +508,10 @@ namespace AutoKey
             settings.Hotkey = SelectedHotkey;
             settings.TopMost = chkTopMost.Checked;
             settings.MinimizeToTray = chkTray.Checked;
+            settings.HideOnStart = chkHideOnStart.Checked;
+            settings.ShowNotifications = chkNotify.Checked;
             settings.PreventSleep = chkPreventSleep.Checked;
+            settings.Profile = SelectedProfile ?? string.Empty;
         }
 
         private static TimeSpan TruncateToSeconds(TimeSpan t) => new TimeSpan(t.Hours, t.Minutes, t.Seconds);
@@ -337,6 +522,147 @@ namespace AutoKey
         private Keys SelectedKey => (cmbKey.SelectedItem as KeyItem)?.Key ?? Keys.Space;
 
         private Keys SelectedHotkey => (cmbHotkey.SelectedItem as KeyItem)?.Key ?? Keys.F6;
+
+        private string SelectedTarget => (cmbWindow.SelectedItem as WindowItem)?.ProcessName ?? string.Empty;
+
+        private bool HoldModeSelected => cmbMode.SelectedIndex == 1;
+
+        private void UpdateModeUi()
+        {
+            bool repeat = !HoldModeSelected;
+            numInterval.Enabled = repeat;
+            cmbUnit.Enabled = repeat;
+            numJitter.Enabled = repeat;
+            numRepeat.Enabled = repeat;
+            numHold.Enabled = repeat;
+            numAfter.Enabled = repeat;
+        }
+
+        private void UpdateButtonTexts()
+        {
+            string hotkey = hotkeyRegistered ? "  (" + KeyNames.GetName(SelectedHotkey) + ")" : string.Empty;
+            btnStart.Text = "▶  Start" + hotkey;
+            btnStop.Text = "■  Stopp" + hotkey;
+        }
+
+        // ------------------------------------------------------------------ Ablauf bearbeiten
+
+        private int SelectedStepIndex =>
+            lstSteps.SelectedIndex >= 0 && lstSteps.SelectedIndex < steps.Count ? lstSteps.SelectedIndex : -1;
+
+        private void RefreshStepList(int select)
+        {
+            bool wasUpdating = updatingUi;
+            updatingUi = true;
+            try
+            {
+                lstSteps.BeginUpdate();
+                lstSteps.Items.Clear();
+                for (int i = 0; i < steps.Count; i++) lstSteps.Items.Add(StepText(i));
+                lstSteps.EndUpdate();
+                lstSteps.SelectedIndex = Math.Max(0, Math.Min(select, steps.Count - 1));
+            }
+            finally
+            {
+                updatingUi = wasUpdating;
+            }
+
+            UpdateStepButtons();
+        }
+
+        private string StepText(int index) => (index + 1).ToString(CultureInfo.CurrentCulture) + ".  " + steps[index].Describe();
+
+        private void UpdateStepButtons()
+        {
+            int i = SelectedStepIndex;
+            btnStepRemove.Enabled = steps.Count > 1;
+            btnStepUp.Enabled = i > 0;
+            btnStepDown.Enabled = i >= 0 && i < steps.Count - 1;
+        }
+
+        /// <summary>Den ausgewählten Schritt in die Eingabefelder darunter laden.</summary>
+        private void LoadStepIntoEditor()
+        {
+            int i = SelectedStepIndex;
+            if (i < 0) return;
+
+            Step step = steps[i];
+            bool wasUpdating = updatingUi;
+            updatingUi = true;
+            try
+            {
+                SelectKey(step.Key);
+                chkCtrl.Checked = step.Ctrl;
+                chkAlt.Checked = step.Alt;
+                chkShift.Checked = step.Shift;
+                SetNumber(numHold, step.HoldMs);
+                SetNumber(numAfter, step.DelayAfterMs);
+            }
+            finally
+            {
+                updatingUi = wasUpdating;
+            }
+
+            UpdateStepButtons();
+        }
+
+        /// <summary>Änderungen in den Eingabefeldern sofort in den ausgewählten Schritt übernehmen.</summary>
+        private void OnEditorChanged()
+        {
+            if (updatingUi) return;
+            int i = SelectedStepIndex;
+            if (i < 0) return;
+
+            Step step = steps[i];
+            step.Key = SelectedKey;
+            step.Ctrl = chkCtrl.Checked;
+            step.Alt = chkAlt.Checked;
+            step.Shift = chkShift.Checked;
+            step.HoldMs = (int)numHold.Value;
+            step.DelayAfterMs = (int)numAfter.Value;
+
+            updatingUi = true;
+            try
+            {
+                lstSteps.Items[i] = StepText(i);
+            }
+            finally
+            {
+                updatingUi = false;
+            }
+        }
+
+        private void AddStep()
+        {
+            int i = SelectedStepIndex;
+            Step step = i >= 0 ? steps[i].Clone() : new Step();
+            steps.Insert(i + 1, step);
+            RefreshStepList(i + 1);
+            LoadStepIntoEditor();
+            cmbKey.Focus();
+        }
+
+        private void RemoveStep()
+        {
+            int i = SelectedStepIndex;
+            if (i < 0 || steps.Count <= 1) return;
+            steps.RemoveAt(i);
+            RefreshStepList(Math.Min(i, steps.Count - 1));
+            LoadStepIntoEditor();
+        }
+
+        private void MoveStep(int delta)
+        {
+            int i = SelectedStepIndex;
+            int j = i + delta;
+            if (i < 0 || j < 0 || j >= steps.Count) return;
+
+            Step tmp = steps[i];
+            steps[i] = steps[j];
+            steps[j] = tmp;
+            RefreshStepList(j);
+            LoadStepIntoEditor();
+        }
 
         private void SelectKey(Keys key)
         {
@@ -354,11 +680,144 @@ namespace AutoKey
             cmbKey.SelectedItem = added;
         }
 
-        private void UpdateButtonTexts()
+        // ------------------------------------------------------------------ Zielfenster
+
+        private void RefreshWindowList() => RefreshWindowList(SelectedTarget);
+
+        private void RefreshWindowList(string select)
         {
-            string hotkey = hotkeyRegistered ? "  (" + KeyNames.GetName(SelectedHotkey) + ")" : string.Empty;
-            btnStart.Text = "▶  Start" + hotkey;
-            btnStop.Text = "■  Stopp" + hotkey;
+            bool wasUpdating = updatingUi;
+            updatingUi = true;
+            try
+            {
+                cmbWindow.BeginUpdate();
+                cmbWindow.Items.Clear();
+                cmbWindow.Items.Add(WindowItem.Any);
+                foreach (WindowItem item in WindowList.GetWindows()) cmbWindow.Items.Add(item);
+                cmbWindow.EndUpdate();
+
+                if (string.IsNullOrEmpty(select))
+                {
+                    cmbWindow.SelectedIndex = 0;
+                    return;
+                }
+
+                foreach (WindowItem item in cmbWindow.Items)
+                {
+                    if (string.Equals(item.ProcessName, select, StringComparison.OrdinalIgnoreCase))
+                    {
+                        cmbWindow.SelectedItem = item;
+                        return;
+                    }
+                }
+
+                // Gespeichertes Programm läuft gerade nicht – trotzdem auswählbar lassen.
+                var missing = new WindowItem(select, string.Empty, false);
+                cmbWindow.Items.Add(missing);
+                cmbWindow.SelectedItem = missing;
+            }
+            finally
+            {
+                updatingUi = wasUpdating;
+            }
+        }
+
+        // ------------------------------------------------------------------ Profile
+
+        private string SelectedProfile => cmbProfile.SelectedIndex > 0 ? (string)cmbProfile.SelectedItem : null;
+
+        private void RefreshProfileList(string select)
+        {
+            bool wasUpdating = updatingUi;
+            updatingUi = true;
+            try
+            {
+                cmbProfile.Items.Clear();
+                cmbProfile.Items.Add(NoProfile);
+                foreach (string name in Settings.ListProfiles()) cmbProfile.Items.Add(name);
+
+                int index = 0;
+                if (!string.IsNullOrEmpty(select))
+                {
+                    for (int i = 1; i < cmbProfile.Items.Count; i++)
+                    {
+                        if (string.Equals((string)cmbProfile.Items[i], select, StringComparison.OrdinalIgnoreCase)) index = i;
+                    }
+                }
+
+                cmbProfile.SelectedIndex = index;
+            }
+            finally
+            {
+                updatingUi = wasUpdating;
+            }
+
+            btnProfileDelete.Enabled = cmbProfile.SelectedIndex > 0;
+        }
+
+        private void OnProfileSelected()
+        {
+            btnProfileDelete.Enabled = cmbProfile.SelectedIndex > 0;
+            if (updatingUi) return;
+
+            string name = SelectedProfile;
+            settings.Profile = name ?? string.Empty;
+            if (name == null) return;
+
+            settings.CopyTaskFrom(Settings.LoadProfile(name));
+            ApplyTaskToUi();
+            SetStatus("Profil „" + name + "“ geladen.");
+        }
+
+        private void SaveProfile()
+        {
+            OnEditorChanged();
+            ReadSettingsFromUi();
+
+            string name = PromptDialog.Show(this, "Profil speichern",
+                "Name des Profils (z. B. Spiel oder Aufgabe):", SelectedProfile ?? string.Empty);
+            if (name == null) return;
+
+            name = Settings.CleanProfileName(name);
+            if (name.Length == 0)
+            {
+                Warn("Bitte einen gültigen Namen eingeben.");
+                return;
+            }
+
+            if (Settings.ProfileExists(name)
+                && !string.Equals(name, SelectedProfile, StringComparison.OrdinalIgnoreCase)
+                && MessageBox.Show(this, "Das Profil „" + name + "“ gibt es schon. Überschreiben?", "AutoKey",
+                    MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes)
+            {
+                return;
+            }
+
+            if (!settings.SaveProfile(name))
+            {
+                Warn("Das Profil konnte nicht gespeichert werden.");
+                return;
+            }
+
+            settings.Profile = name;
+            RefreshProfileList(name);
+            SetStatus("Profil „" + name + "“ gespeichert.");
+        }
+
+        private void DeleteProfile()
+        {
+            string name = SelectedProfile;
+            if (name == null) return;
+            if (MessageBox.Show(this, "Profil „" + name + "“ wirklich löschen?", "AutoKey",
+                    MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes)
+            {
+                return;
+            }
+
+            Settings.DeleteProfile(name);
+            settings.Profile = string.Empty;
+            RefreshProfileList(null);
+            SetStatus("Profil „" + name + "“ gelöscht.");
         }
 
         // ------------------------------------------------------------------ Taste aufnehmen
@@ -368,7 +827,7 @@ namespace AutoKey
             capturing = on;
             btnCapture.Text = on ? "Taste drücken …" : "Aufnehmen …";
             SetStatus(on
-                ? "Jetzt die gewünschte Taste drücken (auch mit Strg/Alt/Shift möglich) …"
+                ? "Jetzt die gewünschte Taste drücken (auch mit Strg/Alt/Shift). Maustasten bitte aus der Liste wählen."
                 : "Bereit.");
         }
 
@@ -381,27 +840,29 @@ namespace AutoKey
                                     || code == Keys.LWin || code == Keys.RWin;
                 if (!modifierOnly && code != Keys.None)
                 {
-                    SelectKey(code);
-                    chkCtrl.Checked = (keyData & Keys.Control) != 0;
-                    chkAlt.Checked = (keyData & Keys.Alt) != 0;
-                    chkShift.Checked = (keyData & Keys.Shift) != 0;
+                    bool wasUpdating = updatingUi;
+                    updatingUi = true;
+                    try
+                    {
+                        SelectKey(code);
+                        chkCtrl.Checked = (keyData & Keys.Control) != 0;
+                        chkAlt.Checked = (keyData & Keys.Alt) != 0;
+                        chkShift.Checked = (keyData & Keys.Shift) != 0;
+                    }
+                    finally
+                    {
+                        updatingUi = wasUpdating;
+                    }
+
+                    OnEditorChanged();
                     SetCapturing(false);
-                    SetStatus("Taste übernommen: " + DescribeKey(code, chkCtrl.Checked, chkAlt.Checked, chkShift.Checked));
+                    SetStatus("Taste übernommen: " + KeyNames.Describe(code, chkCtrl.Checked, chkAlt.Checked, chkShift.Checked));
                 }
 
                 return true;
             }
 
             return base.ProcessCmdKey(ref msg, keyData);
-        }
-
-        private static string DescribeKey(Keys key, bool ctrl, bool alt, bool shift)
-        {
-            string text = KeyNames.GetName(key);
-            if (shift) text = "Shift+" + text;
-            if (alt) text = "Alt+" + text;
-            if (ctrl) text = "Strg+" + text;
-            return text;
         }
 
         // ------------------------------------------------------------------ Globaler Hotkey
@@ -479,25 +940,29 @@ namespace AutoKey
             if (running) return;
             if (capturing) SetCapturing(false);
 
+            OnEditorChanged(); // gerade getippte Werte übernehmen
             ReadSettingsFromUi();
             double intervalMs = settings.IntervalMilliseconds;
 
-            if (settings.Key == settings.Hotkey && !settings.Ctrl && !settings.Alt && !settings.Shift)
+            Step conflict = settings.Steps.FirstOrDefault(s => s.Key == settings.Hotkey && !s.Ctrl && !s.Alt && !s.Shift);
+            if (conflict != null)
             {
-                Warn("Die Taste " + KeyNames.GetName(settings.Key) + " ist gleichzeitig die Start/Stopp-Taste.\n\n"
+                Warn("Die Taste " + KeyNames.GetName(conflict.Key) + " ist gleichzeitig die Start/Stopp-Taste.\n\n"
                      + "Bitte unter „Optionen“ eine andere Start/Stopp-Taste wählen.");
                 return;
             }
 
-            if (intervalMs < MinIntervalMs)
+            if (!settings.HoldMode && intervalMs < MinIntervalMs)
             {
                 Warn("Das Intervall muss mindestens " + MinIntervalMs + " Millisekunden betragen.");
                 return;
             }
 
-            if (settings.HoldMs >= intervalMs)
+            if (settings.TargetProcess.Length > 0 && !WindowList.IsRunning(settings.TargetProcess))
             {
-                Warn("Die Haltedauer (" + settings.HoldMs + " ms) muss kürzer sein als das Intervall.");
+                Warn("„" + settings.TargetProcess + ".exe“ läuft gerade nicht.\n\n"
+                     + "Bitte zuerst das Spiel bzw. Programm starten – oder unter „Nur senden an“ "
+                     + "„(jedes aktive Fenster)“ wählen.");
                 return;
             }
 
@@ -521,26 +986,39 @@ namespace AutoKey
                 stopUtc = stopLocal.ToUniversalTime();
             }
 
-            runKey = settings.Key;
-            runCtrl = settings.Ctrl;
-            runAlt = settings.Alt;
-            runShift = settings.Shift;
+            DateTime now = DateTime.UtcNow;
+            runSteps = settings.Steps.Select(s => s.Clone()).ToArray();
             runScanCode = settings.ScanCode;
+            runHoldMode = settings.HoldMode;
+            runTarget = settings.TargetProcess;
             runIntervalMs = intervalMs;
             runJitter = settings.JitterPercent;
-            runHoldMs = settings.HoldMs;
             runRepeat = settings.Repeat;
             presses = 0;
-            holding = false;
+            cycles = 0;
+            stepIndex = 0;
+            phase = Phase.Waiting;
+            paused = false;
+            holdActive = false;
             sendWarning = null;
             nextDueUtc = firstLocal.ToUniversalTime();
+            notBeforeUtc = DateTime.MinValue;
+            holdSinceUtc = DateTime.MinValue;
+            lastProcessCheckUtc = now;
             running = true;
 
             settings.Save();
             if (settings.PreventSleep) NativeMethods.PreventSleep(true);
             SetRunningUi(true);
             timer.Start();
-            UpdateRunStatus(DateTime.UtcNow);
+            UpdateRunStatus(now);
+
+            if (settings.HideOnStart && Visible)
+            {
+                Hide();
+                Notify("AutoKey läuft im Hintergrund. Stoppen mit " + KeyNames.GetName(settings.Hotkey)
+                       + " oder über das Symbol neben der Uhr.");
+            }
         }
 
         private void StopRun(string message)
@@ -548,29 +1026,40 @@ namespace AutoKey
             if (!running) return;
 
             timer.Stop();
-            if (holding)
-            {
-                ReleaseKey();
-                holding = false;
-            }
-
+            ReleaseEverything();
             running = false;
+            paused = false;
             NativeMethods.PreventSleep(false);
             SetRunningUi(false);
 
-            string text = message + " Ausgeführte Tastendrücke: " + presses.ToString("N0", CultureInfo.CurrentCulture) + ".";
+            string text = message;
+            if (runHoldMode)
+            {
+                if (holdSinceUtc != DateTime.MinValue) text += " Gehalten: " + FormatDuration(DateTime.UtcNow - holdSinceUtc) + ".";
+            }
+            else
+            {
+                if (runSteps.Length > 1) text += " Durchläufe: " + Count(cycles) + ",";
+                text += " Ausgeführte Tastendrücke: " + Count(presses) + ".";
+            }
+
             SetStatus(text);
-            if (!Visible && !closing) tray.ShowBalloonTip(4000, "AutoKey", text, ToolTipIcon.Info);
+            if (!Visible && !closing) Notify(text);
         }
 
         private void SetRunningUi(bool isRunning)
         {
-            grpKey.Enabled = !isRunning;
+            grpSteps.Enabled = !isRunning;
+            grpTarget.Enabled = !isRunning;
             grpSchedule.Enabled = !isRunning;
+            cmbProfile.Enabled = !isRunning;
+            btnProfileSave.Enabled = !isRunning;
+            btnProfileDelete.Enabled = !isRunning && cmbProfile.SelectedIndex > 0;
             cmbHotkey.Enabled = !isRunning;
             btnStart.Enabled = !isRunning;
             btnStop.Enabled = isRunning;
             trayToggle.Text = isRunning ? "Stopp" : "Start";
+            tray.Icon = isRunning ? trayRunningIcon : trayIdleIcon;
             Text = isRunning ? "AutoKey – läuft" : "AutoKey " + AppVersion;
             SetTrayText(isRunning ? "AutoKey – läuft" : "AutoKey – gestoppt");
         }
@@ -580,35 +1069,158 @@ namespace AutoKey
             if (!running) return;
             DateTime now = DateTime.UtcNow;
 
-            if (holding && now >= releaseUtc)
+            // Nur senden, wenn das gewählte Programm im Vordergrund ist.
+            if (runTarget.Length > 0)
             {
-                ReleaseKey();
-                holding = false;
-                if (lastPressOk) presses++; // blockierte Tastendrücke nicht mitzählen
-                SetTrayText("AutoKey – läuft (" + presses.ToString("N0", CultureInfo.CurrentCulture) + "×)");
-
-                if (runRepeat > 0 && presses >= runRepeat)
+                if ((now - lastProcessCheckUtc).TotalMilliseconds >= 1000)
                 {
-                    StopRun("Fertig.");
+                    lastProcessCheckUtc = now;
+                    if (!WindowList.IsRunning(runTarget))
+                    {
+                        StopRun(runTarget + ".exe wurde beendet.");
+                        return;
+                    }
+                }
+
+                bool active = string.Equals(WindowList.ForegroundProcessName(), runTarget, StringComparison.OrdinalIgnoreCase);
+                if (!active)
+                {
+                    if (!paused) PauseRun();
+                    UpdateRunStatus(now);
                     return;
                 }
+
+                if (paused) ResumeRun(now);
             }
 
-            if (!holding && stopUtc.HasValue && now >= stopUtc.Value)
+            if (phase != Phase.Holding && stopUtc.HasValue && now >= stopUtc.Value)
             {
                 StopRun("Stoppzeit erreicht.");
                 return;
             }
 
-            if (!holding && now >= nextDueUtc)
+            if (runHoldMode) TickHoldMode(now);
+            else TickSequence(now);
+
+            if (running) UpdateRunStatus(now);
+        }
+
+        /// <summary>Modus „dauerhaft gedrückt halten“: alle Tasten des Ablaufs gleichzeitig halten.</summary>
+        private void TickHoldMode(DateTime now)
+        {
+            if (holdActive || now < nextDueUtc || now < notBeforeUtc) return;
+
+            bool ok = true;
+            foreach (Step step in runSteps) ok &= SendDown(step);
+            ReportSendResult(ok);
+            holdActive = true;
+            if (holdSinceUtc == DateTime.MinValue) holdSinceUtc = now;
+        }
+
+        /// <summary>Modus „Ablauf wiederholt ausführen“: Schritt für Schritt drücken, halten, warten.</summary>
+        private void TickSequence(DateTime now)
+        {
+            switch (phase)
             {
-                PressKey();
-                holding = true;
-                releaseUtc = now.AddMilliseconds(runHoldMs);
-                nextDueUtc = ComputeNextDue(nextDueUtc, now);
+                case Phase.Waiting:
+                    if (now >= nextDueUtc && now >= notBeforeUtc)
+                    {
+                        stepIndex = 0;
+                        nextDueUtc = ComputeNextDue(nextDueUtc, now);
+                        StartStep(now);
+                    }
+
+                    break;
+
+                case Phase.Holding:
+                    if (now < releaseUtc) break;
+
+                    Step step = runSteps[stepIndex];
+                    SendUp(step);
+                    if (lastPressOk) presses++; // blockierte Eingaben nicht mitzählen
+                    stepIndex++;
+
+                    if (stepIndex < runSteps.Length)
+                    {
+                        phase = Phase.Gap;
+                        gapUntilUtc = now.AddMilliseconds(step.DelayAfterMs);
+                        break;
+                    }
+
+                    // Durchlauf beendet
+                    cycles++;
+                    SetTrayText("AutoKey – läuft (" + Count(runSteps.Length > 1 ? cycles : presses) + "×)");
+                    if (runRepeat > 0 && cycles >= runRepeat)
+                    {
+                        StopRun("Fertig.");
+                        return;
+                    }
+
+                    phase = Phase.Waiting;
+                    notBeforeUtc = now.AddMilliseconds(step.DelayAfterMs);
+                    break;
+
+                case Phase.Gap:
+                    if (now >= gapUntilUtc) StartStep(now);
+                    break;
+            }
+        }
+
+        private void StartStep(DateTime now)
+        {
+            Step step = runSteps[stepIndex];
+            ReportSendResult(SendDown(step));
+            phase = Phase.Holding;
+            releaseUtc = now.AddMilliseconds(step.HoldMs);
+        }
+
+        /// <summary>Zielfenster nicht mehr im Vordergrund: alles loslassen und warten.</summary>
+        private void PauseRun()
+        {
+            paused = true;
+            if (phase == Phase.Holding)
+            {
+                SendUp(runSteps[stepIndex]);
+                phase = Phase.Gap;               // unterbrochenen Schritt nach dem Fortsetzen wiederholen
+                gapUntilUtc = DateTime.MinValue;
             }
 
-            UpdateRunStatus(now);
+            if (holdActive)
+            {
+                ReleaseHeldKeys();
+                holdActive = false;
+            }
+
+            tray.Icon = trayIdleIcon;
+        }
+
+        private void ResumeRun(DateTime now)
+        {
+            paused = false;
+            DateTime resumeAt = now.AddMilliseconds(ResumeDelayMs);
+            if (notBeforeUtc < resumeAt) notBeforeUtc = resumeAt;
+            if (gapUntilUtc < resumeAt) gapUntilUtc = resumeAt;
+            tray.Icon = trayRunningIcon;
+        }
+
+        private void ReleaseEverything()
+        {
+            if (phase == Phase.Holding && stepIndex < runSteps.Length)
+            {
+                SendUp(runSteps[stepIndex]);
+                phase = Phase.Waiting;
+            }
+
+            if (holdActive)
+            {
+                ReleaseHeldKeys();
+                holdActive = false;
+            }
+        }
+
+        private void ReleaseHeldKeys()
+        {
+            for (int i = runSteps.Length - 1; i >= 0; i--) SendUp(runSteps[i]);
         }
 
         private DateTime ComputeNextDue(DateTime previousDue, DateTime now)
@@ -617,34 +1229,28 @@ namespace AutoKey
             if (runJitter > 0) ms *= 1.0 + (random.NextDouble() * 2.0 - 1.0) * runJitter / 100.0;
             ms = Math.Max(ms, MinIntervalMs);
 
-            // Vom geplanten Zeitpunkt aus rechnen (kein Driften), aber verpasste Drücke nicht nachholen.
+            // Vom geplanten Zeitpunkt aus rechnen (kein Driften), aber Verpasstes nicht nachholen.
             DateTime next = previousDue.AddMilliseconds(ms);
             return next > now ? next : now.AddMilliseconds(ms);
         }
 
-        private void PressKey()
+        private bool SendDown(Step step)
         {
-            bool ok;
             try
             {
-                ok = KeySender.Down(runKey, runCtrl, runAlt, runShift, runScanCode);
+                return KeySender.Down(step.Key, step.Ctrl, step.Alt, step.Shift, runScanCode);
             }
             catch (Exception)
             {
-                ok = false;
+                return false;
             }
-
-            lastPressOk = ok;
-            sendWarning = ok
-                ? null
-                : "Windows hat den Tastendruck blockiert. Läuft das Zielprogramm als Administrator? Dann AutoKey ebenfalls als Administrator starten.";
         }
 
-        private void ReleaseKey()
+        private void SendUp(Step step)
         {
             try
             {
-                KeySender.Up(runKey, runCtrl, runAlt, runShift, runScanCode);
+                KeySender.Up(step.Key, step.Ctrl, step.Alt, step.Shift, runScanCode);
             }
             catch (Exception)
             {
@@ -652,42 +1258,77 @@ namespace AutoKey
             }
         }
 
+        private void ReportSendResult(bool ok)
+        {
+            lastPressOk = ok;
+            sendWarning = ok ? null : BlockedMessage;
+        }
+
         // ------------------------------------------------------------------ Status
 
         private void UpdateRunStatus(DateTime now)
         {
-            if (sendWarning != null)
+            if (sendWarning != null && !paused)
             {
                 SetStatus(sendWarning);
                 return;
             }
 
+            string clickHint = runTarget.Length == 0 ? " Jetzt ins Zielfenster klicken!" : string.Empty;
             string text;
-            if (presses == 0 && !holding)
+
+            if (paused)
             {
-                text = "Wartet – erster Tastendruck um " + nextDueUtc.ToLocalTime().ToString("HH:mm:ss", CultureInfo.CurrentCulture)
-                       + " (in " + FormatRemaining(nextDueUtc - now) + "). Jetzt ins Zielfenster klicken!";
+                text = "Pausiert – " + runTarget + ".exe ist nicht im Vordergrund. Es geht automatisch weiter, sobald du dorthin wechselst.";
+            }
+            else if (runHoldMode)
+            {
+                text = holdActive
+                    ? "Hält gedrückt: " + string.Join(" + ", runSteps.Select(s => s.KeyText)) + " – seit " + FormatDuration(now - holdSinceUtc)
+                    : "Wartet – Halten beginnt um " + LocalTime(nextDueUtc) + " (in " + FormatRemaining(nextDueUtc - now) + ")." + clickHint;
+            }
+            else if (cycles == 0 && phase == Phase.Waiting)
+            {
+                text = "Wartet – Start um " + LocalTime(nextDueUtc) + " (in " + FormatRemaining(nextDueUtc - now) + ")." + clickHint;
             }
             else
             {
-                string count = presses.ToString("N0", CultureInfo.CurrentCulture);
-                if (runRepeat > 0) count += " von " + runRepeat.ToString("N0", CultureInfo.CurrentCulture);
-                text = "Läuft – " + count + " Tastendrücke – nächster in " + FormatRemaining(nextDueUtc - now);
+                string limit = runRepeat > 0 ? " von " + Count(runRepeat) : string.Empty;
+                if (runSteps.Length > 1)
+                {
+                    string where = phase == Phase.Waiting
+                        ? "nächster Durchlauf in " + FormatRemaining(Later(nextDueUtc, notBeforeUtc) - now)
+                        : "Schritt " + (stepIndex + 1) + " von " + runSteps.Length;
+                    text = "Läuft – " + Count(cycles) + limit + " Durchläufe – " + where;
+                }
+                else
+                {
+                    text = "Läuft – " + Count(presses) + limit + " Tastendrücke – nächster in "
+                           + FormatRemaining(Later(nextDueUtc, notBeforeUtc) - now);
+                }
             }
 
-            if (stopUtc.HasValue)
-                text += " – Stopp um " + stopUtc.Value.ToLocalTime().ToString("HH:mm", CultureInfo.CurrentCulture);
-
+            if (stopUtc.HasValue) text += " – Stopp um " + stopUtc.Value.ToLocalTime().ToString("HH:mm", CultureInfo.CurrentCulture);
             SetStatus(text);
         }
+
+        private static DateTime Later(DateTime a, DateTime b) => a > b ? a : b;
+
+        private static string LocalTime(DateTime utc) => utc.ToLocalTime().ToString("HH:mm:ss", CultureInfo.CurrentCulture);
+
+        private static string Count(long value) => value.ToString("N0", CultureInfo.CurrentCulture);
 
         private static string FormatRemaining(TimeSpan span)
         {
             if (span < TimeSpan.Zero) span = TimeSpan.Zero;
             if (span.TotalSeconds < 10) return span.TotalSeconds.ToString("0.0", CultureInfo.CurrentCulture) + " s";
             if (span.TotalSeconds < 60) return Math.Ceiling(span.TotalSeconds).ToString(CultureInfo.CurrentCulture) + " s";
+            return FormatDuration(TimeSpan.FromSeconds(Math.Ceiling(span.TotalSeconds)));
+        }
 
-            long seconds = (long)Math.Ceiling(span.TotalSeconds);
+        private static string FormatDuration(TimeSpan span)
+        {
+            long seconds = Math.Max(0, (long)span.TotalSeconds);
             return string.Format(CultureInfo.CurrentCulture, "{0:00}:{1:00}:{2:00}", seconds / 3600, seconds / 60 % 60, seconds % 60);
         }
 
@@ -706,6 +1347,11 @@ namespace AutoKey
             tray.Text = text;
         }
 
+        private void Notify(string text)
+        {
+            if (chkNotify.Checked) tray.ShowBalloonTip(4000, "AutoKey", text, ToolTipIcon.Info);
+        }
+
         private void Warn(string message) =>
             MessageBox.Show(this, message, "AutoKey", MessageBoxButtons.OK, MessageBoxIcon.Warning);
 
@@ -713,9 +1359,10 @@ namespace AutoKey
         {
             MessageBox.Show(
                 "AutoKey " + AppVersion + "\n\n"
-                + "Drückt automatisch eine Taste – in festen Abständen oder zu einer bestimmten Uhrzeit.\n\n"
-                + "Einstellungen werden gespeichert in:\n" + Settings.FilePath + "\n\n"
-                + "Startoptionen:\n  /start  – sofort mit den gespeicherten Einstellungen loslegen\n  /tray   – minimiert im Infobereich starten",
+                + "Drückt automatisch Tasten und Maustasten – einzeln oder als Ablauf, in festen Abständen, "
+                + "zu einer bestimmten Uhrzeit oder dauerhaft gehalten.\n\n"
+                + "Einstellungen und Profile werden gespeichert in:\n" + Settings.BaseDirectory + "\n\n"
+                + "Startoptionen:\n  /start  – sofort mit den gespeicherten Einstellungen loslegen\n  /tray   – unsichtbar im Infobereich starten",
                 "Über AutoKey", MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
 
@@ -753,6 +1400,7 @@ namespace AutoKey
         {
             closing = true;
             StopRun("Beendet.");
+            OnEditorChanged();
             ReadSettingsFromUi();
             settings.Save();
             base.OnFormClosing(e);

@@ -1,9 +1,9 @@
 # AutoKey
 
-Kostenloses Windows-Programm, das automatisch eine Taste für dich drückt –
-in festen Abständen, eine bestimmte Anzahl Mal oder ab einer bestimmten Uhrzeit.
+Kostenloses Windows-Programm, das automatisch Tasten und Maustasten für dich drückt –
+einzeln oder als Ablauf, in festen Abständen, ab einer bestimmten Uhrzeit oder dauerhaft gehalten.
 
-- **Eine einzige Datei**: `AutoKey.exe` (ca. 110 KB), keine Installation nötig
+- **Eine einzige Datei**: `AutoKey.exe` (ca. 130 KB), keine Installation nötig
 - Läuft unter **Windows 10 und 11** (nutzt das dort eingebaute .NET Framework 4.8)
 - Deutsche Oberfläche, Einstellungen werden automatisch gespeichert
 
@@ -18,49 +18,83 @@ in festen Abständen, eine bestimmte Anzahl Mal oder ab einer bestimmten Uhrzeit
 
 ## Funktionen
 
-| Bereich | Einstellung | Bedeutung |
-|---|---|---|
-| **Welche Taste?** | Taste | Auswahl aus der Liste – oder **Aufnehmen …** klicken und die gewünschte Taste (auch Kombinationen wie Strg+S) drücken |
-| | Mit gedrückt | Strg / Alt / Shift zusätzlich halten |
-| | Haltedauer | Wie lange die Taste gedrückt bleibt (Millisekunden) |
-| | Scancode senden | Für Spiele, die normale simulierte Tasten ignorieren |
-| **Wann?** | Drücken alle | Intervall in Millisekunden, Sekunden, Minuten oder Stunden |
-| | Zufällig variieren | Intervall um ± x % zufällig verändern (wirkt menschlicher) |
-| | Wiederholungen | Nach so vielen Tastendrücken automatisch stoppen – `0` = unbegrenzt |
-| | Erster Tastendruck | **nach X Sekunden** (Zeit, um ins Zielfenster zu wechseln) **oder um HH:MM:SS Uhr** |
-| | Automatisch stoppen | Optional zu einer bestimmten Uhrzeit beenden |
-| **Optionen** | Start/Stopp-Taste | Globale Taste (Standard **F6**), funktioniert auch, wenn ein anderes Programm aktiv ist |
-| | Immer im Vordergrund | AutoKey-Fenster bleibt sichtbar |
-| | Infobereich | Beim Minimieren neben die Uhr verschwinden (Rechtsklick auf das Symbol: Start/Stopp, Beenden) |
-| | Standby verhindern | PC geht nicht in den Standby, solange AutoKey läuft |
+### Ablauf (mehrere Schritte)
 
-**Wichtig:** Der Tastendruck geht immer an das **gerade aktive Fenster**. Also nach dem Start
-ins Zielprogramm klicken – die Statuszeile zeigt einen Countdown bis zum ersten Tastendruck.
+Statt einer einzelnen Taste kannst du einen **Ablauf** zusammenstellen – ideal für monotone Aufgaben in Spielen:
+
+```
+1.  1             (50 ms)   →  800 ms warten
+2.  Maus links    (50 ms)   →  2 s warten
+3.  E             (50 ms)
+```
+
+- **+ Hinzufügen / – Entfernen / ▲ ▼** in der Liste, darunter wird der ausgewählte Schritt bearbeitet.
+- **Taste / Maustaste:** alle üblichen Tasten, außerdem **Maus links/rechts/Mitte** und die **Seitentasten** –
+  oder **Aufnehmen …** klicken und die Taste (auch Strg+S usw.) drücken.
+- **Haltedauer:** wie lange gedrückt wird (bis 10 Minuten – z. B. zum „Gedrückthalten“ beim Abbauen).
+- **Danach warten:** Pause bis zum nächsten Schritt.
+
+### Wann?
+
+| Einstellung | Bedeutung |
+|---|---|
+| **Modus** | *Ablauf wiederholt ausführen* – oder *Tasten dauerhaft gedrückt halten* (z. B. Auto-Laufen mit W, bis du stoppst) |
+| **Wiederholen alle** | Abstand zwischen zwei Durchläufen (ms bis Stunden) |
+| **Zufällig variieren** | Abstand um ± x % verändern |
+| **Wiederholungen** | Nach so vielen Durchläufen stoppen – `0` = unbegrenzt |
+| **Beginnen** | *nach X Sekunden* oder *um HH:MM:SS Uhr* |
+| **Automatisch stoppen** | Optional zu einer bestimmten Uhrzeit beenden |
+
+### Spiel / Zielfenster
+
+Unter **Nur senden an** das Spiel auswählen. Dann gilt:
+
+- Tasten gehen **nur an dieses Spiel** – wechselst du per Alt+Tab z. B. in den Browser oder Discord,
+  **pausiert AutoKey automatisch** (gedrückte Tasten werden losgelassen) und macht weiter, sobald du zurück im Spiel bist.
+- Wird das Spiel beendet, **stoppt AutoKey** von selbst.
+- **Scancode senden** einschalten, wenn ein Spiel die Tasten sonst nicht annimmt.
+
+### Profile
+
+Oben **Speichern unter …** sichert Ablauf, Zeitplan und Zielfenster unter einem Namen (z. B. „Angeln“, „Farmen“).
+Über die Auswahlliste lädst du ein Profil mit einem Klick wieder.
+
+### Im Hintergrund laufen lassen
+
+- **F6** (änderbar) startet und stoppt – auch mitten im Spiel, ohne das Fenster zu öffnen.
+- **Nach dem Start unsichtbar im Hintergrund weiterlaufen:** das Fenster verschwindet beim Start;
+  am Symbol neben der Uhr zeigt ein **grüner Punkt**, dass AutoKey läuft (Rechtsklick: Start/Stopp, Fenster, Beenden).
+- **Benachrichtigungen** (z. B. „Fertig“) lassen sich abschalten.
+- **Standby verhindern**, solange AutoKey läuft.
+
+**Wichtig:** Ohne gewähltes Zielfenster geht der Tastendruck immer an das **gerade aktive Fenster** –
+die Statuszeile zeigt einen Countdown bis zum Start.
 
 ### Beispiele
 
-- **Alle 30 Sekunden Leertaste, endlos:** Taste `Leertaste`, Drücken alle `30 Sekunden`, Wiederholungen `0`.
-- **Einmal um 14:30 Uhr Enter drücken:** Taste `Enter`, Wiederholungen `1`, Erster Tastendruck `um 14:30:00`.
-- **Von 8 bis 17 Uhr jede Minute F5:** Taste `F5`, Drücken alle `1 Minuten`, Erster Tastendruck `um 08:00:00`,
-  Automatisch stoppen `um 17:00:00`.
-
-Liegt die Startuhrzeit heute schon in der Vergangenheit, startet AutoKey morgen zu dieser Uhrzeit.
+- **Alle 30 Sekunden Leertaste, endlos:** ein Schritt `Leertaste`, Wiederholen alle `30 Sekunden`, Wiederholungen `0`.
+- **Angeln in einem Spiel:** Schritt 1 `Maus rechts` → `1500 ms` warten, Schritt 2 `Maus rechts`; Wiederholen alle `20 Sekunden`;
+  Nur senden an: das Spiel.
+- **Auto-Laufen:** Schritt `W`, Modus *dauerhaft gedrückt halten*.
+- **Einmal um 14:30 Uhr Enter drücken:** Schritt `Enter`, Wiederholungen `1`, Beginnen `um 14:30:00`.
 
 ### Startoptionen (für Verknüpfungen oder die Windows-Aufgabenplanung)
 
 ```
 AutoKey.exe /start    sofort mit den zuletzt gespeicherten Einstellungen loslegen
-AutoKey.exe /tray     minimiert im Infobereich starten
+AutoKey.exe /tray     unsichtbar im Infobereich starten
 ```
 
-Die Einstellungen liegen in `%APPDATA%\AutoKey\settings.ini`.
+Einstellungen und Profile liegen in `%APPDATA%\AutoKey\`.
 
 ## Hinweise
 
 - Läuft das Zielprogramm **als Administrator**, muss auch AutoKey als Administrator gestartet werden
-  (Rechtsklick → *Als Administrator ausführen*), sonst blockiert Windows die Tastendrücke. AutoKey zeigt das dann an.
+  (Rechtsklick → *Als Administrator ausführen*), sonst blockiert Windows die Eingaben. AutoKey zeigt das dann an.
 - Ein **gesperrter PC** (Win+L) nimmt keine Tastendrücke an.
-- Einige Spiele mit Anti-Cheat ignorieren oder verbieten simulierte Tastendrücke – im Zweifel die Regeln des Spiels beachten.
+- **Online-Spiele:** Viele Spiele verbieten Makros/Automatisierung in ihren Nutzungsbedingungen, und Anti-Cheat-Systeme
+  können simulierte Eingaben erkennen. AutoKey versucht bewusst **nicht**, sich davor zu verstecken – bitte prüfe die Regeln
+  deines Spiels, bevor du AutoKey dort nutzt, um eine Sperre deines Kontos zu vermeiden.
 
 ## Selbst bauen
 
