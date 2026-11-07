@@ -114,15 +114,15 @@ namespace AutoKey
             }
         }
 
-        /// <summary>Tasten, die als globaler Start/Stopp-Hotkey wählbar sind.</summary>
-        public static IEnumerable<Keys> HotkeyKeys
+        /// <summary>Tastenkombination inkl. Zusatztasten-Bits, z. B. Keys.Control | Keys.F6 → "Strg+F6".</summary>
+        public static string DescribeCombo(Keys keyData)
         {
-            get
-            {
-                for (Keys k = Keys.F1; k <= Keys.F12; k++) yield return k;
-                yield return Keys.Pause;
-                yield return Keys.Scroll;
-            }
+            Keys code = keyData & Keys.KeyCode;
+            if (code == Keys.None) return "(keine)";
+            return Describe(code,
+                (keyData & Keys.Control) != 0,
+                (keyData & Keys.Alt) != 0,
+                (keyData & Keys.Shift) != 0);
         }
 
         /// <summary>Taste mit Zusatztasten, z. B. "Strg+Shift+S".</summary>
@@ -139,6 +139,7 @@ namespace AutoKey
         {
             key &= Keys.KeyCode;
 
+            if (key == Keys.None) return "(keine)";
             if (Names.TryGetValue(key, out string name)) return name;
             if (key >= Keys.D0 && key <= Keys.D9) return ((char)('0' + (key - Keys.D0))).ToString();
             if (key >= Keys.NumPad0 && key <= Keys.NumPad9) return "Num " + (key - Keys.NumPad0);

@@ -1,10 +1,13 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Globalization;
+using System.IO;
 using System.Linq;
 using System.Reflection;
+using System.Threading;
 using System.Windows.Forms;
 
 namespace AutoKey
@@ -15,15 +18,30 @@ namespace AutoKey
         {
             Waiting,  // wartet auf den nächsten Durchlauf
             Holding,  // Taste eines Schritts ist gedrückt
+            Typing,   // Text wird Zeichen für Zeichen getippt
             Gap,      // Pause zwischen zwei Schritten
         }
 
-        private const int HotkeyId = 0xA0C1;
+        private enum CaptureTarget
+        {
+            None,
+            StepKey,
+            StartHotkey,
+            PauseHotkey,
+        }
+
+        private const int StartHotkeyId = 0xA0C1;
+        private const int PauseHotkeyId = 0xA0C2;
         private const int MinIntervalMs = 20;
         private const int ResumeDelayMs = 300; // kurze Pause, nachdem das Zielfenster wieder aktiv geworden ist
         private const string NoProfile = "(kein Profil)";
         private const string BlockedMessage =
             "Windows hat die Eingabe blockiert. Läuft das Zielprogramm als Administrator? Dann AutoKey ebenfalls als Administrator starten.";
+
+        private static readonly int[] ToneStart = { 880, 90, 1175, 130 };
+        private static readonly int[] ToneStop = { 1175, 90, 660, 160 };
+        private static readonly int[] TonePause = { 660, 160 };
+        private static readonly int[] ToneResume = { 880, 160 };
 
         private static readonly string AppVersion =
             Assembly.GetExecutingAssembly().GetName().Version.ToString(3);
@@ -31,49 +49,60 @@ namespace AutoKey
         private readonly Settings settings;
         private readonly bool startImmediately;
         private readonly bool startInTray;
+        private readonly string startProfile;
         private readonly Random random = new Random();
         private readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer { Interval = 10 };
+        private readonly System.Windows.Forms.Timer pickTimer = new System.Windows.Forms.Timer { Interval = 1000 };
+        private readonly ToolTip tips = new ToolTip { AutoPopDelay = 20000, InitialDelay = 400 };
         private readonly Icon appIcon;
         private Icon trayIdleIcon, trayRunningIcon;
 
         // Oberfläche
-        private ComboBox cmbProfile, cmbKey, cmbWindow, cmbMode, cmbUnit, cmbHotkey;
-        private Button btnProfileSave, btnProfileDelete, btnStepAdd, btnStepRemove, btnStepUp, btnStepDown;
-        private Button btnCapture, btnRefreshWindows, btnStart, btnStop;
+        private ComboBox cmbProfile, cmbType, cmbKey, cmbWheelDir, cmbWindow, cmbMode, cmbUnit;
+        private Button btnProfileSave, btnProfileDelete, btnStepAdd, btnStepRemove, btnStepUp, btnStepDown, btnRecord;
+        private Button btnCapture, btnPickPosition, btnRefreshWindows, btnHotkey, btnPauseHotkey, btnPauseClear, btnStart, btnStop;
         private GroupBox grpSteps, grpTarget, grpSchedule, grpOptions;
         private ListBox lstSteps;
-        private CheckBox chkCtrl, chkAlt, chkShift, chkScanCode, chkStop;
-        private CheckBox chkTopMost, chkTray, chkHideOnStart, chkNotify, chkPreventSleep;
-        private NumericUpDown numHold, numAfter, numInterval, numJitter, numRepeat, numDelay;
+        private Label lblKey, lblText, lblWheel, lblWheelNote, lblMods, lblHold, lblHoldNote, lblPosition, lblHotkey, lblPauseHotkey;
+        private TextBox txtText;
+        private CheckBox chkCtrl, chkAlt, chkShift, chkMouseFixed, chkScanCode, chkStop;
+        private CheckBox chkTopMost, chkTray, chkHideOnStart, chkNotify, chkBeep, chkPreventSleep;
+        private NumericUpDown numHold, numAfter, numWheel, numX, numY, numInterval, numJitter, numRepeat, numDelay;
         private RadioButton rbDelay, rbTime;
         private DateTimePicker dtpStart, dtpStop;
         private Label lblStatus;
         private NotifyIcon tray;
-        private ToolStripMenuItem trayToggle;
+        private ToolStripMenuItem trayToggle, trayPause;
 
         // Bearbeitung
         private readonly List<Step> steps = new List<Step>();
         private bool updatingUi; // unterdrückt Ereignisse, während die Oberfläche per Code befüllt wird
-        private bool capturing, hotkeyRegistered, closing;
+        private CaptureTarget capture = CaptureTarget.None;
+        private bool startHotkeyOk, pauseHotkeyOk, closing;
+        private int pickCountdown;
+        private MacroRecorder recorder;
+        private RecordForm recordForm;
 
         // Laufzustand
-        private bool running, paused, holdActive, lastPressOk;
+        private bool running, paused, userPaused, holdActive, lastPressOk;
         private Step[] runSteps = new Step[0];
         private bool runScanCode, runHoldMode;
         private string runTarget = string.Empty;
         private double runIntervalMs;
-        private int runJitter, stepIndex;
+        private int runJitter, stepIndex, textIndex;
         private long runRepeat, presses, cycles;
         private Phase phase;
-        private DateTime nextDueUtc, releaseUtc, gapUntilUtc, notBeforeUtc, holdSinceUtc, lastProcessCheckUtc;
+        private DateTime runStartedUtc, nextDueUtc, releaseUtc, gapUntilUtc, notBeforeUtc, nextCharUtc;
+        private DateTime holdSinceUtc, lastProcessCheckUtc;
         private DateTime? stopUtc;
         private string sendWarning;
-        private string lastStatus = string.Empty, lastTrayText = string.Empty;
+        private string lastStatus = string.Empty, lastTrayText = string.Empty, lastTitle = string.Empty;
 
-        public MainForm(bool startImmediately, bool startInTray)
+        public MainForm(bool startImmediately, bool startInTray, string startProfile)
         {
             this.startImmediately = startImmediately;
             this.startInTray = startInTray;
+            this.startProfile = startProfile;
             settings = Settings.Load();
             appIcon = LoadAppIcon();
 
@@ -90,13 +119,31 @@ namespace AutoKey
             BuildUi();
             BuildTray();
             ApplySettingsToUi();
+
+            string profileHint = null;
+            if (!string.IsNullOrEmpty(startProfile))
+            {
+                if (Settings.ProfileExists(startProfile))
+                {
+                    settings.Profile = startProfile;
+                    settings.CopyTaskFrom(Settings.LoadProfile(startProfile));
+                    ApplyTaskToUi();
+                    profileHint = "Profil „" + startProfile + "“ geladen.";
+                }
+                else
+                {
+                    profileHint = "Profil „" + startProfile + "“ wurde nicht gefunden.";
+                }
+            }
+
             RefreshProfileList(settings.Profile);
 
             ResumeLayout(false);
             PerformLayout();
 
             timer.Tick += OnTick;
-            SetStatus("Bereit. Ablauf zusammenstellen und auf Start klicken.");
+            pickTimer.Tick += OnPickTick;
+            SetStatus(profileHint ?? "Bereit. Ablauf zusammenstellen oder aufzeichnen, dann auf Start klicken.");
         }
 
         // ------------------------------------------------------------------ Aufbau der Oberfläche
@@ -131,48 +178,94 @@ namespace AutoKey
             };
 
             // --- Ablauf (linke Spalte)
-            grpSteps = NewGroup("Ablauf – die Schritte werden nacheinander ausgeführt", leftX, top, colWidth, 280);
-            lstSteps = new ListBox { Location = new Point(12, 24), Size = new Size(300, 124), IntegralHeight = false };
+            grpSteps = NewGroup("Ablauf – die Schritte werden nacheinander ausgeführt", leftX, top, colWidth, 365);
+            lstSteps = new ListBox { Location = new Point(12, 24), Size = new Size(300, 146), IntegralHeight = false };
             lstSteps.SelectedIndexChanged += (s, e) => { if (!updatingUi) LoadStepIntoEditor(); };
-            btnStepAdd = NewButton("+  Hinzufügen", 108, 320, 23, (s, e) => AddStep());
-            btnStepRemove = NewButton("–  Entfernen", 108, 320, 53, (s, e) => RemoveStep());
-            btnStepUp = NewButton("▲  Nach oben", 108, 320, 83, (s, e) => MoveStep(-1));
-            btnStepDown = NewButton("▼  Nach unten", 108, 320, 113, (s, e) => MoveStep(1));
-            grpSteps.Controls.AddRange(new Control[] { lstSteps, btnStepAdd, btnStepRemove, btnStepUp, btnStepDown });
+            lstSteps.KeyDown += OnStepListKeyDown;
+            lstSteps.DoubleClick += (s, e) => { if (cmbType.SelectedIndex == 0) SetCapture(CaptureTarget.StepKey); };
+            btnStepAdd = NewButton("+  Hinzufügen", 108, 320, 20, (s, e) => AddStep());
+            btnStepRemove = NewButton("–  Entfernen", 108, 320, 50, (s, e) => RemoveStep());
+            btnStepUp = NewButton("▲  Nach oben", 108, 320, 80, (s, e) => MoveStep(-1));
+            btnStepDown = NewButton("▼  Nach unten", 108, 320, 110, (s, e) => MoveStep(1));
+            btnRecord = NewButton("●  Aufzeichnen …", 108, 320, 140, (s, e) => StartRecording());
+            btnRecord.ForeColor = Color.FromArgb(180, 0, 0);
+            grpSteps.Controls.AddRange(new Control[] { lstSteps, btnStepAdd, btnStepRemove, btnStepUp, btnStepDown, btnRecord });
+            tips.SetToolTip(lstSteps, "Entf = Schritt entfernen, Einfg = hinzufügen, Strg+Pfeil = verschieben, Doppelklick = Taste aufnehmen");
+            tips.SetToolTip(btnRecord, "Tasten, Mausklicks und Mausrad im Spiel vorführen – AutoKey macht daraus die Schritte.");
 
+            cmbType = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 170 };
+            cmbType.Items.AddRange(new object[] { "Taste / Maustaste", "Text eintippen", "Mausrad drehen" });
             cmbKey = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 170, MaxDropDownItems = 20 };
             foreach (Keys k in KeyNames.CommonKeys) cmbKey.Items.Add(new KeyItem(k));
             btnCapture = new Button { Text = "Aufnehmen …", Size = new Size(100, 25) };
-            btnCapture.Click += (s, e) => SetCapturing(!capturing);
+            btnCapture.Click += (s, e) => SetCapture(capture == CaptureTarget.StepKey ? CaptureTarget.None : CaptureTarget.StepKey);
+            txtText = new TextBox { Width = 278, MaxLength = Step.MaxTextLength };
+            tips.SetToolTip(txtText, "Wird Zeichen für Zeichen getippt – z. B. ein Chat-Befehl. Für Enter danach einen Schritt „Enter“ anhängen.");
+            numWheel = NewNumber(1, Step.MaxWheel, 60);
+            lblWheelNote = NewNote("Rasten", FieldX + 66, 0);
+            cmbWheelDir = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 110 };
+            cmbWheelDir.Items.AddRange(new object[] { "nach oben", "nach unten" });
             chkCtrl = NewCheck("Strg");
             chkAlt = NewCheck("Alt");
             chkShift = NewCheck("Shift");
             numHold = NewNumber(1, Step.MaxHoldMs, 80);
+            tips.SetToolTip(numHold, "Wie lange die Taste gedrückt bleibt. Viele Spiele brauchen mindestens 30–50 ms.");
+            chkMouseFixed = NewCheck("fest:");
+            tips.SetToolTip(chkMouseFixed, "Die Maus wird vor dem Klick an diese Bildschirmposition gesetzt.");
+            numX = NewNumber(-30000, 30000, 58);
+            numY = NewNumber(-30000, 30000, 58);
+            btnPickPosition = new Button { Text = "Position (3 s)", Size = new Size(100, 25) };
+            btnPickPosition.Click += (s, e) => StartPositionPick();
+            tips.SetToolTip(btnPickPosition, "Nach dem Klick 3 Sekunden Zeit, die Maus an die gewünschte Stelle zu bewegen.");
             numAfter = NewNumber(0, Step.MaxDelayAfterMs, 80);
 
-            int y = 158;
-            AddLabel(grpSteps, "Taste / Maustaste:", y);
+            int y = 180;
+            AddLabel(grpSteps, "Art:", y);
+            AddField(grpSteps, cmbType, FieldX, y);
+            y += RowHeight;
+            lblKey = AddLabel(grpSteps, "Taste / Maustaste:", y);
             AddField(grpSteps, cmbKey, FieldX, y);
             AddField(grpSteps, btnCapture, FieldX + 178, y);
+            lblText = AddLabel(grpSteps, "Text:", y);
+            AddField(grpSteps, txtText, FieldX, y);
+            lblWheel = AddLabel(grpSteps, "Mausrad:", y);
+            AddField(grpSteps, numWheel, FieldX, y);
+            lblWheelNote.Location = new Point(FieldX + 66, y + 4);
+            grpSteps.Controls.Add(lblWheelNote);
+            AddField(grpSteps, cmbWheelDir, FieldX + 120, y);
             y += RowHeight;
-            AddLabel(grpSteps, "Mit gedrückt:", y);
+            lblMods = AddLabel(grpSteps, "Mit gedrückt:", y);
             AddField(grpSteps, chkCtrl, FieldX, y);
             AddField(grpSteps, chkAlt, FieldX + 60, y);
             AddField(grpSteps, chkShift, FieldX + 115, y);
             y += RowHeight;
-            AddLabel(grpSteps, "Haltedauer:", y);
+            lblHold = AddLabel(grpSteps, "Haltedauer:", y);
             AddField(grpSteps, numHold, FieldX, y);
-            AddNote(grpSteps, "ms", FieldX + 86, y);
+            lblHoldNote = NewNote("ms", FieldX + 86, y);
+            grpSteps.Controls.Add(lblHoldNote);
+            y += RowHeight;
+            lblPosition = AddLabel(grpSteps, "Mausposition:", y);
+            AddField(grpSteps, chkMouseFixed, FieldX, y);
+            AddField(grpSteps, numX, FieldX + 52, y);
+            AddField(grpSteps, numY, FieldX + 114, y);
+            AddField(grpSteps, btnPickPosition, FieldX + 178, y);
             y += RowHeight;
             AddLabel(grpSteps, "Danach warten:", y);
             AddField(grpSteps, numAfter, FieldX, y);
             AddNote(grpSteps, "ms bis zum nächsten Schritt", FieldX + 86, y);
 
-            cmbKey.SelectedIndexChanged += (s, e) => OnEditorChanged();
+            cmbType.SelectedIndexChanged += (s, e) => { OnEditorChanged(); UpdateEditorVisibility(); };
+            cmbKey.SelectedIndexChanged += (s, e) => { OnEditorChanged(); UpdateEditorVisibility(); };
+            txtText.TextChanged += (s, e) => OnEditorChanged();
+            numWheel.ValueChanged += (s, e) => OnEditorChanged();
+            cmbWheelDir.SelectedIndexChanged += (s, e) => OnEditorChanged();
             chkCtrl.CheckedChanged += (s, e) => OnEditorChanged();
             chkAlt.CheckedChanged += (s, e) => OnEditorChanged();
             chkShift.CheckedChanged += (s, e) => OnEditorChanged();
             numHold.ValueChanged += (s, e) => OnEditorChanged();
+            chkMouseFixed.CheckedChanged += (s, e) => OnEditorChanged();
+            numX.ValueChanged += (s, e) => { if (!updatingUi) chkMouseFixed.Checked = true; OnEditorChanged(); };
+            numY.ValueChanged += (s, e) => { if (!updatingUi) chkMouseFixed.Checked = true; OnEditorChanged(); };
             numAfter.ValueChanged += (s, e) => OnEditorChanged();
 
             // --- Spiel / Zielfenster (linke Spalte)
@@ -182,7 +275,7 @@ namespace AutoKey
             cmbWindow.DropDown += (s, e) => RefreshWindowList();
             btnRefreshWindows = new Button { Text = "↻", Size = new Size(30, 25) };
             btnRefreshWindows.Click += (s, e) => RefreshWindowList();
-            new ToolTip().SetToolTip(btnRefreshWindows, "Liste der offenen Programme aktualisieren");
+            tips.SetToolTip(btnRefreshWindows, "Liste der offenen Programme aktualisieren");
             AddLabel(grpTarget, "Nur senden an:", 24);
             AddField(grpTarget, cmbWindow, FieldX, 24);
             AddField(grpTarget, btnRefreshWindows, FieldX + 248, 24);
@@ -196,6 +289,7 @@ namespace AutoKey
             });
             chkScanCode = NewCheck("Scancode senden (für Spiele empfohlen)");
             chkScanCode.Location = new Point(12, 94);
+            tips.SetToolTip(chkScanCode, "Sendet Tasten so, wie sie von der Tastatur kommen. Hilft, wenn ein Spiel die Tasten sonst ignoriert.");
             grpTarget.Controls.Add(chkScanCode);
 
             // --- Wann? (rechte Spalte)
@@ -211,6 +305,7 @@ namespace AutoKey
             cmbUnit = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 115 };
             cmbUnit.Items.AddRange(new object[] { "Millisekunden", "Sekunden", "Minuten", "Stunden" });
             numJitter = NewNumber(0, 90, 55);
+            tips.SetToolTip(numJitter, "Verändert Abstände, Haltedauern und Wartezeiten zufällig um bis zu diesen Prozentsatz – wirkt weniger mechanisch.");
             numRepeat = NewNumber(0, 100_000_000, 90);
             numRepeat.ThousandsSeparator = true;
             rbDelay = NewRadio("nach");
@@ -231,7 +326,7 @@ namespace AutoKey
             AddLabel(grpSchedule, "Zufällig variieren:", y);
             AddNote(grpSchedule, "±", FieldX, y);
             AddField(grpSchedule, numJitter, FieldX + 16, y);
-            AddNote(grpSchedule, "%", FieldX + 77, y);
+            AddNote(grpSchedule, "%   (auch Haltedauern und Pausen)", FieldX + 77, y);
             y += RowHeight;
             AddLabel(grpSchedule, "Wiederholungen:", y);
             AddField(grpSchedule, numRepeat, FieldX, y);
@@ -258,26 +353,42 @@ namespace AutoKey
             dtpStop.ValueChanged += (s, e) => chkStop.Checked = true;
 
             // --- Optionen (rechte Spalte)
-            grpOptions = NewGroup("Optionen", rightX, grpSchedule.Bottom + 8, colWidth, 24 + RowHeight + 5 * 24 + 6);
-            cmbHotkey = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 90 };
-            foreach (Keys k in KeyNames.HotkeyKeys) cmbHotkey.Items.Add(new KeyItem(k));
-            cmbHotkey.SelectedIndexChanged += (s, e) => RegisterHotkey();
-            AddLabel(grpOptions, "Start/Stopp-Taste:", 24);
-            AddField(grpOptions, cmbHotkey, FieldX, 24);
-            AddNote(grpOptions, "(funktioniert auch im Spiel)", FieldX + 96, 24);
+            grpOptions = NewGroup("Optionen", rightX, grpSchedule.Bottom + 8, colWidth, 24 + 2 * RowHeight + 6 * 24 + 6);
+            lblHotkey = NewValueLabel(110);
+            btnHotkey = new Button { Text = "Ändern …", Size = new Size(80, 25) };
+            btnHotkey.Click += (s, e) => SetCapture(capture == CaptureTarget.StartHotkey ? CaptureTarget.None : CaptureTarget.StartHotkey);
+            tips.SetToolTip(btnHotkey, "F-Taste oder Kombination mit Strg/Alt/Shift wählen – z. B. Strg+F6, wenn das Spiel F6 selbst benutzt.");
+            lblPauseHotkey = NewValueLabel(110);
+            btnPauseHotkey = new Button { Text = "Ändern …", Size = new Size(80, 25) };
+            btnPauseHotkey.Click += (s, e) => SetCapture(capture == CaptureTarget.PauseHotkey ? CaptureTarget.None : CaptureTarget.PauseHotkey);
+            btnPauseClear = new Button { Text = "Keine", Size = new Size(60, 25) };
+            btnPauseClear.Click += (s, e) => { settings.PauseHotkey = Keys.None; RegisterHotkeys(); };
+            tips.SetToolTip(lblPauseHotkey, "Unterbricht den Ablauf, ohne die Zähler zurückzusetzen – nochmal drücken macht weiter.");
+
+            y = 24;
+            AddLabel(grpOptions, "Start/Stopp-Taste:", y);
+            AddField(grpOptions, lblHotkey, FieldX, y);
+            AddField(grpOptions, btnHotkey, FieldX + 116, y);
+            y += RowHeight;
+            AddLabel(grpOptions, "Pause-Taste:", y);
+            AddField(grpOptions, lblPauseHotkey, FieldX, y);
+            AddField(grpOptions, btnPauseHotkey, FieldX + 116, y);
+            AddField(grpOptions, btnPauseClear, FieldX + 202, y);
+            y += RowHeight;
 
             chkTopMost = NewCheck("Fenster immer im Vordergrund");
             chkTopMost.CheckedChanged += (s, e) => TopMost = chkTopMost.Checked;
             chkTray = NewCheck("Beim Minimieren in den Infobereich (neben der Uhr)");
             chkHideOnStart = NewCheck("Nach dem Start unsichtbar im Hintergrund weiterlaufen");
             chkNotify = NewCheck("Benachrichtigungen anzeigen (z. B. „Fertig“)");
+            chkBeep = NewCheck("Signalton bei Start, Stopp und Pause");
+            tips.SetToolTip(chkBeep, "Kurzer Ton, damit du im Spiel hörst, dass AutoKey gestartet bzw. gestoppt wurde.");
             chkPreventSleep = NewCheck("Standby verhindern, solange AutoKey läuft");
-            int optY = 24 + RowHeight;
-            foreach (CheckBox c in new[] { chkTopMost, chkTray, chkHideOnStart, chkNotify, chkPreventSleep })
+            foreach (CheckBox c in new[] { chkTopMost, chkTray, chkHideOnStart, chkNotify, chkBeep, chkPreventSleep })
             {
-                c.Location = new Point(12, optY);
+                c.Location = new Point(12, y);
                 grpOptions.Controls.Add(c);
-                optY += 24;
+                y += 24;
             }
 
             // Unterkanten beider Spalten angleichen
@@ -316,8 +427,12 @@ namespace AutoKey
         {
             var menu = new ContextMenuStrip();
             trayToggle = new ToolStripMenuItem("Start", null, (s, e) => ToggleRun());
+            trayPause = new ToolStripMenuItem("Pause", null, (s, e) => TogglePause()) { Enabled = false };
             menu.Items.Add(trayToggle);
+            menu.Items.Add(trayPause);
             menu.Items.Add("Fenster anzeigen", null, (s, e) => RestoreFromTray());
+            menu.Items.Add(new ToolStripSeparator());
+            menu.Items.Add("Profilordner öffnen", null, (s, e) => OpenProfileFolder());
             menu.Items.Add("Über AutoKey", null, (s, e) => ShowAbout());
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("Beenden", null, (s, e) => Close());
@@ -373,12 +488,30 @@ namespace AutoKey
             new GroupBox { Text = title, Bounds = new Rectangle(x, y, width, height) };
 
         /// <summary>Beschriftung in der linken Spalte, vertikal an den Eingabefeldern ausgerichtet.</summary>
-        private static void AddLabel(Control parent, string text, int y) =>
-            parent.Controls.Add(new Label { Text = text, AutoSize = true, Location = new Point(12, y + 4) });
+        private static Label AddLabel(Control parent, string text, int y)
+        {
+            var label = new Label { Text = text, AutoSize = true, Location = new Point(12, y + 4) };
+            parent.Controls.Add(label);
+            return label;
+        }
 
         /// <summary>Kurzer Hinweistext hinter einem Eingabefeld.</summary>
+        private static Label NewNote(string text, int x, int y) =>
+            new Label { Text = text, AutoSize = true, Location = new Point(x, y + 4) };
+
         private static void AddNote(Control parent, string text, int x, int y) =>
-            parent.Controls.Add(new Label { Text = text, AutoSize = true, Location = new Point(x, y + 4) });
+            parent.Controls.Add(NewNote(text, x, y));
+
+        /// <summary>Umrahmte Anzeige eines Werts (z. B. der Hotkey).</summary>
+        private static Label NewValueLabel(int width) =>
+            new Label
+            {
+                AutoSize = false,
+                Size = new Size(width, 23),
+                BorderStyle = BorderStyle.Fixed3D,
+                TextAlign = ContentAlignment.MiddleCenter,
+                BackColor = SystemColors.Window,
+            };
 
         private static void AddField(Control parent, Control field, int x, int y)
         {
@@ -431,18 +564,11 @@ namespace AutoKey
             try
             {
                 ApplyTaskToUi();
-
-                int hotkeyIndex = 0;
-                for (int i = 0; i < cmbHotkey.Items.Count; i++)
-                {
-                    if (((KeyItem)cmbHotkey.Items[i]).Key == settings.Hotkey) hotkeyIndex = i;
-                }
-
-                cmbHotkey.SelectedIndex = hotkeyIndex;
                 chkTopMost.Checked = settings.TopMost;
                 chkTray.Checked = settings.MinimizeToTray;
                 chkHideOnStart.Checked = settings.HideOnStart;
                 chkNotify.Checked = settings.ShowNotifications;
+                chkBeep.Checked = settings.Beep;
                 chkPreventSleep.Checked = settings.PreventSleep;
             }
             finally
@@ -450,7 +576,7 @@ namespace AutoKey
                 updatingUi = wasUpdating;
             }
 
-            UpdateButtonTexts();
+            UpdateHotkeyUi();
         }
 
         /// <summary>Ablauf, Zeitplan und Zielfenster in die Oberfläche übernehmen (auch beim Laden eines Profils).</summary>
@@ -505,11 +631,12 @@ namespace AutoKey
             settings.StopAtTime = chkStop.Checked;
             settings.StopTime = TruncateToSeconds(dtpStop.Value.TimeOfDay);
 
-            settings.Hotkey = SelectedHotkey;
+            // Hotkeys stehen bereits in settings (werden beim Ändern direkt gesetzt)
             settings.TopMost = chkTopMost.Checked;
             settings.MinimizeToTray = chkTray.Checked;
             settings.HideOnStart = chkHideOnStart.Checked;
             settings.ShowNotifications = chkNotify.Checked;
+            settings.Beep = chkBeep.Checked;
             settings.PreventSleep = chkPreventSleep.Checked;
             settings.Profile = SelectedProfile ?? string.Empty;
         }
@@ -521,8 +648,6 @@ namespace AutoKey
 
         private Keys SelectedKey => (cmbKey.SelectedItem as KeyItem)?.Key ?? Keys.Space;
 
-        private Keys SelectedHotkey => (cmbHotkey.SelectedItem as KeyItem)?.Key ?? Keys.F6;
-
         private string SelectedTarget => (cmbWindow.SelectedItem as WindowItem)?.ProcessName ?? string.Empty;
 
         private bool HoldModeSelected => cmbMode.SelectedIndex == 1;
@@ -532,17 +657,27 @@ namespace AutoKey
             bool repeat = !HoldModeSelected;
             numInterval.Enabled = repeat;
             cmbUnit.Enabled = repeat;
-            numJitter.Enabled = repeat;
             numRepeat.Enabled = repeat;
-            numHold.Enabled = repeat;
             numAfter.Enabled = repeat;
+            UpdateEditorVisibility();
         }
 
-        private void UpdateButtonTexts()
+        private void UpdateHotkeyUi()
         {
-            string hotkey = hotkeyRegistered ? "  (" + KeyNames.GetName(SelectedHotkey) + ")" : string.Empty;
+            lblHotkey.Text = KeyNames.DescribeCombo(settings.Hotkey);
+            lblHotkey.ForeColor = startHotkeyOk || !IsHandleCreated ? SystemColors.WindowText : Color.Firebrick;
+            lblPauseHotkey.Text = KeyNames.DescribeCombo(settings.PauseHotkey);
+            lblPauseHotkey.ForeColor = pauseHotkeyOk || settings.PauseHotkey == Keys.None || !IsHandleCreated
+                ? SystemColors.WindowText
+                : Color.Firebrick;
+            btnPauseClear.Enabled = settings.PauseHotkey != Keys.None;
+
+            string hotkey = startHotkeyOk ? "  (" + KeyNames.DescribeCombo(settings.Hotkey) + ")" : string.Empty;
             btnStart.Text = "▶  Start" + hotkey;
             btnStop.Text = "■  Stopp" + hotkey;
+            trayToggle.Text = (running ? "Stopp" : "Start") + hotkey;
+            trayPause.Text = (userPaused ? "Weiter" : "Pause")
+                             + (pauseHotkeyOk ? "  (" + KeyNames.DescribeCombo(settings.PauseHotkey) + ")" : string.Empty);
         }
 
         // ------------------------------------------------------------------ Ablauf bearbeiten
@@ -591,11 +726,18 @@ namespace AutoKey
             updatingUi = true;
             try
             {
+                cmbType.SelectedIndex = (int)step.Type;
                 SelectKey(step.Key);
+                txtText.Text = step.Text;
+                SetNumber(numWheel, Math.Max(1, Math.Abs(step.Wheel)));
+                cmbWheelDir.SelectedIndex = step.Wheel < 0 ? 1 : 0;
                 chkCtrl.Checked = step.Ctrl;
                 chkAlt.Checked = step.Alt;
                 chkShift.Checked = step.Shift;
                 SetNumber(numHold, step.HoldMs);
+                chkMouseFixed.Checked = step.MouseFixed;
+                SetNumber(numX, step.MouseX);
+                SetNumber(numY, step.MouseY);
                 SetNumber(numAfter, step.DelayAfterMs);
             }
             finally
@@ -603,7 +745,28 @@ namespace AutoKey
                 updatingUi = wasUpdating;
             }
 
+            UpdateEditorVisibility();
             UpdateStepButtons();
+        }
+
+        /// <summary>Je nach Art des Schritts nur die passenden Felder zeigen.</summary>
+        private void UpdateEditorVisibility()
+        {
+            var type = (StepType)Math.Max(0, cmbType.SelectedIndex);
+            bool key = type == StepType.Key;
+            bool text = type == StepType.Text;
+            bool wheel = type == StepType.Wheel;
+            bool mouse = wheel || (key && KeySender.IsMouseButton(SelectedKey));
+
+            lblKey.Visible = cmbKey.Visible = btnCapture.Visible = key;
+            lblText.Visible = txtText.Visible = text;
+            lblWheel.Visible = numWheel.Visible = lblWheelNote.Visible = cmbWheelDir.Visible = wheel;
+            lblMods.Visible = chkCtrl.Visible = chkAlt.Visible = chkShift.Visible = key;
+            lblHold.Visible = numHold.Visible = lblHoldNote.Visible = key || text;
+            lblHold.Text = text ? "Pro Zeichen:" : "Haltedauer:";
+            lblHoldNote.Text = text ? "ms Tippgeschwindigkeit" : "ms";
+            numHold.Enabled = !HoldModeSelected || text;
+            lblPosition.Visible = chkMouseFixed.Visible = numX.Visible = numY.Visible = btnPickPosition.Visible = mouse;
         }
 
         /// <summary>Änderungen in den Eingabefeldern sofort in den ausgewählten Schritt übernehmen.</summary>
@@ -614,11 +777,17 @@ namespace AutoKey
             if (i < 0) return;
 
             Step step = steps[i];
+            step.Type = (StepType)Math.Max(0, cmbType.SelectedIndex);
             step.Key = SelectedKey;
+            step.Text = txtText.Text;
+            step.Wheel = (int)numWheel.Value * (cmbWheelDir.SelectedIndex == 1 ? -1 : 1);
             step.Ctrl = chkCtrl.Checked;
             step.Alt = chkAlt.Checked;
             step.Shift = chkShift.Checked;
             step.HoldMs = (int)numHold.Value;
+            step.MouseFixed = chkMouseFixed.Checked;
+            step.MouseX = (int)numX.Value;
+            step.MouseY = (int)numY.Value;
             step.DelayAfterMs = (int)numAfter.Value;
 
             updatingUi = true;
@@ -664,6 +833,23 @@ namespace AutoKey
             LoadStepIntoEditor();
         }
 
+        private void ReplaceSteps(IEnumerable<Step> newSteps, bool append)
+        {
+            if (!append) steps.Clear();
+            steps.AddRange(newSteps);
+            if (steps.Count == 0) steps.Add(new Step());
+            RefreshStepList(append ? steps.Count - 1 : 0);
+            LoadStepIntoEditor();
+        }
+
+        private void OnStepListKeyDown(object sender, KeyEventArgs e)
+        {
+            if (e.KeyCode == Keys.Delete) { RemoveStep(); e.Handled = true; }
+            else if (e.KeyCode == Keys.Insert) { AddStep(); e.Handled = true; }
+            else if (e.Control && e.KeyCode == Keys.Up) { MoveStep(-1); e.Handled = true; }
+            else if (e.Control && e.KeyCode == Keys.Down) { MoveStep(1); e.Handled = true; }
+        }
+
         private void SelectKey(Keys key)
         {
             foreach (KeyItem item in cmbKey.Items)
@@ -678,6 +864,130 @@ namespace AutoKey
             var added = new KeyItem(key);
             cmbKey.Items.Add(added);
             cmbKey.SelectedItem = added;
+        }
+
+        // ------------------------------------------------------------------ Mausposition aufnehmen
+
+        private void StartPositionPick()
+        {
+            if (pickTimer.Enabled) return;
+            pickCountdown = 3;
+            btnPickPosition.Text = "… " + pickCountdown;
+            btnPickPosition.Enabled = false;
+            SetStatus("Maus jetzt an die gewünschte Stelle bewegen – Position wird in 3 Sekunden übernommen.");
+            pickTimer.Start();
+        }
+
+        private void OnPickTick(object sender, EventArgs e)
+        {
+            pickCountdown--;
+            if (pickCountdown > 0)
+            {
+                btnPickPosition.Text = "… " + pickCountdown;
+                return;
+            }
+
+            pickTimer.Stop();
+            Point p = Cursor.Position;
+            bool wasUpdating = updatingUi;
+            updatingUi = true;
+            try
+            {
+                SetNumber(numX, p.X);
+                SetNumber(numY, p.Y);
+                chkMouseFixed.Checked = true;
+            }
+            finally
+            {
+                updatingUi = wasUpdating;
+            }
+
+            OnEditorChanged();
+            btnPickPosition.Text = "Position (3 s)";
+            btnPickPosition.Enabled = true;
+            SetStatus("Mausposition übernommen: " + p.X + ", " + p.Y);
+        }
+
+        // ------------------------------------------------------------------ Aufzeichnung
+
+        private void StartRecording()
+        {
+            if (running || recorder != null) return;
+            if (capture != CaptureTarget.None) SetCapture(CaptureTarget.None);
+
+            var ignored = new List<Keys> { settings.Hotkey & Keys.KeyCode };
+            if (settings.PauseHotkey != Keys.None) ignored.Add(settings.PauseHotkey & Keys.KeyCode);
+            recorder = new MacroRecorder(ignored, IsOverOwnWindow);
+
+            if (!recorder.Start())
+            {
+                recorder.Dispose();
+                recorder = null;
+                Warn("Die Aufzeichnung konnte nicht gestartet werden.\n\n"
+                     + "Windows hat das Mitlesen der Eingaben verweigert. Bitte AutoKey einmal als Administrator starten "
+                     + "oder die Schritte von Hand anlegen.");
+                return;
+            }
+
+            recordForm = new RecordForm(recorder, KeyNames.DescribeCombo(settings.Hotkey), appIcon);
+            recordForm.FormClosed += (s, e) => FinishRecording();
+            recordForm.Show(this);
+            btnRecord.Enabled = false;
+            SetStatus("Aufzeichnung läuft – im Spiel vorführen, Beenden mit " + KeyNames.DescribeCombo(settings.Hotkey) + " oder „Fertig“.");
+        }
+
+        private bool IsOverOwnWindow(Point p)
+        {
+            try
+            {
+                if (recordForm != null && recordForm.Visible && recordForm.Bounds.Contains(p)) return true;
+                if (Visible && WindowState != FormWindowState.Minimized && Bounds.Contains(p)) return true;
+            }
+            catch (Exception)
+            {
+                // ignorieren
+            }
+
+            return false;
+        }
+
+        private void FinishRecording()
+        {
+            if (recorder == null) return;
+
+            recorder.Stop();
+            bool keep = recordForm != null && recordForm.DialogResult == DialogResult.OK;
+            bool usePositions = recordForm == null || recordForm.UsePositions;
+            List<Step> recorded = keep ? recorder.ToSteps(usePositions) : new List<Step>();
+
+            recorder.Dispose();
+            recorder = null;
+            recordForm?.Dispose();
+            recordForm = null;
+            btnRecord.Enabled = true;
+            Activate();
+
+            if (!keep)
+            {
+                SetStatus("Aufzeichnung verworfen.");
+                return;
+            }
+
+            if (recorded.Count == 0)
+            {
+                SetStatus("Es wurde nichts aufgezeichnet.");
+                return;
+            }
+
+            DialogResult answer = MessageBox.Show(this,
+                recorded.Count.ToString(CultureInfo.CurrentCulture) + " Schritte aufgezeichnet.\n\n"
+                + "Sollen sie den bisherigen Ablauf ersetzen?\n\n"
+                + "Ja = ersetzen      Nein = ans Ende anhängen",
+                "AutoKey – Aufzeichnung", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question);
+            if (answer == DialogResult.Cancel) return;
+
+            ReplaceSteps(recorded, answer == DialogResult.No);
+            SetStatus(recorded.Count + " aufgezeichnete Schritte übernommen – Haltedauern und Wartezeiten können unten angepasst werden.");
         }
 
         // ------------------------------------------------------------------ Zielfenster
@@ -801,7 +1111,7 @@ namespace AutoKey
 
             settings.Profile = name;
             RefreshProfileList(name);
-            SetStatus("Profil „" + name + "“ gespeichert.");
+            SetStatus("Profil „" + name + "“ gespeichert. Direkt damit starten: AutoKey.exe /profile:\"" + name + "\" /start");
         }
 
         private void DeleteProfile()
@@ -820,114 +1130,206 @@ namespace AutoKey
             SetStatus("Profil „" + name + "“ gelöscht.");
         }
 
-        // ------------------------------------------------------------------ Taste aufnehmen
-
-        private void SetCapturing(bool on)
+        private void OpenProfileFolder()
         {
-            capturing = on;
-            btnCapture.Text = on ? "Taste drücken …" : "Aufnehmen …";
-            SetStatus(on
-                ? "Jetzt die gewünschte Taste drücken (auch mit Strg/Alt/Shift). Maustasten bitte aus der Liste wählen."
-                : "Bereit.");
+            try
+            {
+                Directory.CreateDirectory(Settings.ProfileDirectory);
+                Process.Start("explorer.exe", "\"" + Settings.ProfileDirectory + "\"");
+            }
+            catch (Exception ex)
+            {
+                Log.Error("Profilordner öffnen", ex);
+                Warn("Der Ordner konnte nicht geöffnet werden:\n" + Settings.ProfileDirectory);
+            }
+        }
+
+        // ------------------------------------------------------------------ Tasten aufnehmen (Schritt und Hotkeys)
+
+        private void SetCapture(CaptureTarget target)
+        {
+            capture = target;
+            btnCapture.Text = target == CaptureTarget.StepKey ? "Taste drücken …" : "Aufnehmen …";
+            btnHotkey.Text = target == CaptureTarget.StartHotkey ? "Drücken …" : "Ändern …";
+            btnPauseHotkey.Text = target == CaptureTarget.PauseHotkey ? "Drücken …" : "Ändern …";
+
+            switch (target)
+            {
+                case CaptureTarget.StepKey:
+                    SetStatus("Jetzt die gewünschte Taste drücken (auch mit Strg/Alt/Shift). Maustasten bitte aus der Liste wählen.");
+                    break;
+                case CaptureTarget.StartHotkey:
+                    SetStatus("Jetzt die neue Start/Stopp-Taste drücken – z. B. F6, Strg+F6 oder Alt+Q. Esc = abbrechen.");
+                    break;
+                case CaptureTarget.PauseHotkey:
+                    SetStatus("Jetzt die neue Pause-Taste drücken – z. B. F7 oder Strg+F7. Esc = abbrechen.");
+                    break;
+                default:
+                    SetStatus("Bereit.");
+                    break;
+            }
         }
 
         protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
         {
-            if (capturing)
-            {
-                Keys code = keyData & Keys.KeyCode;
-                bool modifierOnly = code == Keys.ShiftKey || code == Keys.ControlKey || code == Keys.Menu
-                                    || code == Keys.LWin || code == Keys.RWin;
-                if (!modifierOnly && code != Keys.None)
-                {
-                    bool wasUpdating = updatingUi;
-                    updatingUi = true;
-                    try
-                    {
-                        SelectKey(code);
-                        chkCtrl.Checked = (keyData & Keys.Control) != 0;
-                        chkAlt.Checked = (keyData & Keys.Alt) != 0;
-                        chkShift.Checked = (keyData & Keys.Shift) != 0;
-                    }
-                    finally
-                    {
-                        updatingUi = wasUpdating;
-                    }
+            if (capture == CaptureTarget.None) return base.ProcessCmdKey(ref msg, keyData);
 
-                    OnEditorChanged();
-                    SetCapturing(false);
-                    SetStatus("Taste übernommen: " + KeyNames.Describe(code, chkCtrl.Checked, chkAlt.Checked, chkShift.Checked));
+            Keys code = keyData & Keys.KeyCode;
+            bool modifierOnly = code == Keys.ShiftKey || code == Keys.ControlKey || code == Keys.Menu
+                                || code == Keys.LWin || code == Keys.RWin;
+            if (modifierOnly || code == Keys.None) return true;
+
+            CaptureTarget target = capture;
+            if (target == CaptureTarget.StepKey)
+            {
+                bool wasUpdating = updatingUi;
+                updatingUi = true;
+                try
+                {
+                    SelectKey(code);
+                    chkCtrl.Checked = (keyData & Keys.Control) != 0;
+                    chkAlt.Checked = (keyData & Keys.Alt) != 0;
+                    chkShift.Checked = (keyData & Keys.Shift) != 0;
+                }
+                finally
+                {
+                    updatingUi = wasUpdating;
                 }
 
+                OnEditorChanged();
+                UpdateEditorVisibility();
+                SetCapture(CaptureTarget.None);
+                SetStatus("Taste übernommen: " + KeyNames.DescribeCombo(keyData));
                 return true;
             }
 
-            return base.ProcessCmdKey(ref msg, keyData);
+            // Hotkeys
+            if (code == Keys.Escape && (keyData & (Keys.Control | Keys.Alt | Keys.Shift)) == 0)
+            {
+                SetCapture(CaptureTarget.None);
+                return true;
+            }
+
+            Keys combo = keyData & (Keys.KeyCode | Keys.Control | Keys.Alt | Keys.Shift);
+            if (!IsHotkeyAllowed(combo))
+            {
+                SetStatus("Bitte eine F-Taste (F1–F24, Pause, Rollen) oder eine Kombination mit Strg/Alt/Shift wählen – "
+                          + "eine einzelne Buchstaben- oder Zifferntaste würde das Tippen überall blockieren.");
+                return true;
+            }
+
+            Keys other = target == CaptureTarget.StartHotkey ? settings.PauseHotkey : settings.Hotkey;
+            if (combo == other)
+            {
+                SetStatus(KeyNames.DescribeCombo(combo) + " ist schon die andere Taste – bitte eine andere wählen.");
+                return true;
+            }
+
+            if (target == CaptureTarget.StartHotkey) settings.Hotkey = combo;
+            else settings.PauseHotkey = combo;
+            SetCapture(CaptureTarget.None);
+            RegisterHotkeys();
+            settings.Save();
+            return true;
         }
 
-        // ------------------------------------------------------------------ Globaler Hotkey
+        private static bool IsHotkeyAllowed(Keys combo)
+        {
+            Keys code = combo & Keys.KeyCode;
+            if ((combo & (Keys.Control | Keys.Alt | Keys.Shift)) != 0) return true;
+            return (code >= Keys.F1 && code <= Keys.F24) || code == Keys.Pause || code == Keys.Scroll;
+        }
+
+        // ------------------------------------------------------------------ Globale Hotkeys
 
         protected override void OnHandleCreated(EventArgs e)
         {
             base.OnHandleCreated(e);
-            RegisterHotkey();
+            RegisterHotkeys();
         }
 
         protected override void OnHandleDestroyed(EventArgs e)
         {
-            UnregisterHotkey();
+            UnregisterHotkeys();
             base.OnHandleDestroyed(e);
         }
 
-        private void RegisterHotkey()
+        private void RegisterHotkeys()
         {
-            UnregisterHotkey();
+            UnregisterHotkeys();
             if (!IsHandleCreated) return;
 
-            try
-            {
-                hotkeyRegistered = NativeMethods.RegisterHotKey(Handle, HotkeyId, NativeMethods.MOD_NOREPEAT, (uint)SelectedHotkey);
-            }
-            catch (Exception)
-            {
-                hotkeyRegistered = false;
-            }
+            startHotkeyOk = RegisterHotkey(StartHotkeyId, settings.Hotkey);
+            pauseHotkeyOk = settings.PauseHotkey != Keys.None && RegisterHotkey(PauseHotkeyId, settings.PauseHotkey);
+            UpdateHotkeyUi();
 
-            UpdateButtonTexts();
-            if (!hotkeyRegistered)
+            if (!startHotkeyOk)
             {
-                SetStatus("Die Taste " + KeyNames.GetName(SelectedHotkey)
+                SetStatus("Die Taste " + KeyNames.DescribeCombo(settings.Hotkey)
                           + " wird schon von einem anderen Programm benutzt – bitte eine andere Start/Stopp-Taste wählen.");
+            }
+            else if (settings.PauseHotkey != Keys.None && !pauseHotkeyOk)
+            {
+                SetStatus("Die Pause-Taste " + KeyNames.DescribeCombo(settings.PauseHotkey)
+                          + " wird schon von einem anderen Programm benutzt – bitte eine andere wählen.");
             }
         }
 
-        private void UnregisterHotkey()
+        private bool RegisterHotkey(int id, Keys combo)
         {
-            if (!hotkeyRegistered) return;
             try
             {
-                NativeMethods.UnregisterHotKey(Handle, HotkeyId);
+                uint modifiers = NativeMethods.MOD_NOREPEAT;
+                if ((combo & Keys.Control) != 0) modifiers |= NativeMethods.MOD_CONTROL;
+                if ((combo & Keys.Alt) != 0) modifiers |= NativeMethods.MOD_ALT;
+                if ((combo & Keys.Shift) != 0) modifiers |= NativeMethods.MOD_SHIFT;
+                return NativeMethods.RegisterHotKey(Handle, id, modifiers, (uint)(combo & Keys.KeyCode));
+            }
+            catch (Exception)
+            {
+                return false;
+            }
+        }
+
+        private void UnregisterHotkeys()
+        {
+            try
+            {
+                if (startHotkeyOk) NativeMethods.UnregisterHotKey(Handle, StartHotkeyId);
+                if (pauseHotkeyOk) NativeMethods.UnregisterHotKey(Handle, PauseHotkeyId);
             }
             catch (Exception)
             {
                 // ignorieren
             }
 
-            hotkeyRegistered = false;
+            startHotkeyOk = false;
+            pauseHotkeyOk = false;
         }
 
         protected override void WndProc(ref Message m)
         {
-            if (m.Msg == NativeMethods.WM_HOTKEY && m.WParam.ToInt32() == HotkeyId)
+            if (m.Msg == NativeMethods.WM_HOTKEY)
             {
-                if (!capturing) ToggleRun();
-                return;
+                int id = m.WParam.ToInt32();
+                if (id == StartHotkeyId)
+                {
+                    if (recordForm != null) recordForm.Finish();
+                    else if (capture == CaptureTarget.None) ToggleRun();
+                    return;
+                }
+
+                if (id == PauseHotkeyId)
+                {
+                    if (running && recordForm == null) TogglePause();
+                    return;
+                }
             }
 
             base.WndProc(ref m);
         }
 
-        // ------------------------------------------------------------------ Start / Stopp
+        // ------------------------------------------------------------------ Start / Stopp / Pause
 
         private void ToggleRun()
         {
@@ -935,26 +1337,64 @@ namespace AutoKey
             else StartRun();
         }
 
+        private void TogglePause()
+        {
+            if (!running) return;
+            userPaused = !userPaused;
+            Tone(userPaused ? TonePause : ToneResume);
+            UpdateHotkeyUi();
+            if (!Visible) Notify(userPaused ? "Pausiert." : "Weiter geht's.");
+        }
+
         private void StartRun()
         {
-            if (running) return;
-            if (capturing) SetCapturing(false);
+            if (running || recorder != null) return;
+            if (capture != CaptureTarget.None) SetCapture(CaptureTarget.None);
 
             OnEditorChanged(); // gerade getippte Werte übernehmen
             ReadSettingsFromUi();
             double intervalMs = settings.IntervalMilliseconds;
 
-            Step conflict = settings.Steps.FirstOrDefault(s => s.Key == settings.Hotkey && !s.Ctrl && !s.Alt && !s.Shift);
-            if (conflict != null)
+            Keys hotkeyCode = settings.Hotkey & Keys.KeyCode;
+            for (int i = 0; i < settings.Steps.Count; i++)
             {
-                Warn("Die Taste " + KeyNames.GetName(conflict.Key) + " ist gleichzeitig die Start/Stopp-Taste.\n\n"
-                     + "Bitte unter „Optionen“ eine andere Start/Stopp-Taste wählen.");
-                return;
+                Step s = settings.Steps[i];
+                string prefix = "Schritt " + (i + 1) + ": ";
+                if (s.Type == StepType.Key && s.Key == hotkeyCode
+                    && s.Ctrl == ((settings.Hotkey & Keys.Control) != 0)
+                    && s.Alt == ((settings.Hotkey & Keys.Alt) != 0)
+                    && s.Shift == ((settings.Hotkey & Keys.Shift) != 0))
+                {
+                    Warn(prefix + KeyNames.DescribeCombo(settings.Hotkey) + " ist gleichzeitig die Start/Stopp-Taste.\n\n"
+                         + "Bitte unter „Optionen“ eine andere Start/Stopp-Taste wählen.");
+                    return;
+                }
+
+                if (s.Type == StepType.Text && s.Text.Length == 0)
+                {
+                    Warn(prefix + "Es wurde kein Text eingegeben.");
+                    return;
+                }
+
+                if (s.Type == StepType.Wheel && s.Wheel == 0)
+                {
+                    Warn(prefix + "Mausrad-Rasten dürfen nicht 0 sein.");
+                    return;
+                }
             }
 
             if (!settings.HoldMode && intervalMs < MinIntervalMs)
             {
                 Warn("Das Intervall muss mindestens " + MinIntervalMs + " Millisekunden betragen.");
+                return;
+            }
+
+            Step[] runList = settings.HoldMode
+                ? settings.Steps.Where(s => s.Type == StepType.Key).Select(s => s.Clone()).ToArray()
+                : settings.Steps.Select(s => s.Clone()).ToArray();
+            if (runList.Length == 0)
+            {
+                Warn("Im Modus „dauerhaft gedrückt halten“ wird mindestens ein Schritt der Art „Taste / Maustaste“ benötigt.");
                 return;
             }
 
@@ -987,7 +1427,7 @@ namespace AutoKey
             }
 
             DateTime now = DateTime.UtcNow;
-            runSteps = settings.Steps.Select(s => s.Clone()).ToArray();
+            runSteps = runList;
             runScanCode = settings.ScanCode;
             runHoldMode = settings.HoldMode;
             runTarget = settings.TargetProcess;
@@ -997,26 +1437,32 @@ namespace AutoKey
             presses = 0;
             cycles = 0;
             stepIndex = 0;
+            textIndex = 0;
             phase = Phase.Waiting;
             paused = false;
+            userPaused = false;
             holdActive = false;
             sendWarning = null;
+            runStartedUtc = now;
             nextDueUtc = firstLocal.ToUniversalTime();
             notBeforeUtc = DateTime.MinValue;
+            gapUntilUtc = DateTime.MinValue;
             holdSinceUtc = DateTime.MinValue;
             lastProcessCheckUtc = now;
             running = true;
 
             settings.Save();
             if (settings.PreventSleep) NativeMethods.PreventSleep(true);
+            NativeMethods.HighTimerResolution(true);
             SetRunningUi(true);
             timer.Start();
+            Tone(ToneStart);
             UpdateRunStatus(now);
 
             if (settings.HideOnStart && Visible)
             {
                 Hide();
-                Notify("AutoKey läuft im Hintergrund. Stoppen mit " + KeyNames.GetName(settings.Hotkey)
+                Notify("AutoKey läuft im Hintergrund. Stoppen mit " + KeyNames.DescribeCombo(settings.Hotkey)
                        + " oder über das Symbol neben der Uhr.");
             }
         }
@@ -1029,8 +1475,11 @@ namespace AutoKey
             ReleaseEverything();
             running = false;
             paused = false;
+            userPaused = false;
+            NativeMethods.HighTimerResolution(false);
             NativeMethods.PreventSleep(false);
             SetRunningUi(false);
+            if (!closing) Tone(ToneStop);
 
             string text = message;
             if (runHoldMode)
@@ -1040,9 +1489,10 @@ namespace AutoKey
             else
             {
                 if (runSteps.Length > 1) text += " Durchläufe: " + Count(cycles) + ",";
-                text += " Ausgeführte Tastendrücke: " + Count(presses) + ".";
+                text += " Ausgeführte Eingaben: " + Count(presses) + ".";
             }
 
+            text += " Laufzeit " + FormatDuration(DateTime.UtcNow - runStartedUtc) + ".";
             SetStatus(text);
             if (!Visible && !closing) Notify(text);
         }
@@ -1055,13 +1505,16 @@ namespace AutoKey
             cmbProfile.Enabled = !isRunning;
             btnProfileSave.Enabled = !isRunning;
             btnProfileDelete.Enabled = !isRunning && cmbProfile.SelectedIndex > 0;
-            cmbHotkey.Enabled = !isRunning;
+            btnHotkey.Enabled = !isRunning;
+            btnPauseHotkey.Enabled = !isRunning;
+            btnPauseClear.Enabled = !isRunning && settings.PauseHotkey != Keys.None;
             btnStart.Enabled = !isRunning;
             btnStop.Enabled = isRunning;
-            trayToggle.Text = isRunning ? "Stopp" : "Start";
+            trayPause.Enabled = isRunning;
             tray.Icon = isRunning ? trayRunningIcon : trayIdleIcon;
-            Text = isRunning ? "AutoKey – läuft" : "AutoKey " + AppVersion;
+            SetTitle(isRunning ? "AutoKey – läuft" : "AutoKey " + AppVersion);
             SetTrayText(isRunning ? "AutoKey – läuft" : "AutoKey – gestoppt");
+            UpdateHotkeyUi();
         }
 
         private void OnTick(object sender, EventArgs e)
@@ -1070,6 +1523,7 @@ namespace AutoKey
             DateTime now = DateTime.UtcNow;
 
             // Nur senden, wenn das gewählte Programm im Vordergrund ist.
+            bool windowInactive = false;
             if (runTarget.Length > 0)
             {
                 if ((now - lastProcessCheckUtc).TotalMilliseconds >= 1000)
@@ -1082,18 +1536,19 @@ namespace AutoKey
                     }
                 }
 
-                bool active = string.Equals(WindowList.ForegroundProcessName(), runTarget, StringComparison.OrdinalIgnoreCase);
-                if (!active)
-                {
-                    if (!paused) PauseRun();
-                    UpdateRunStatus(now);
-                    return;
-                }
-
-                if (paused) ResumeRun(now);
+                windowInactive = !string.Equals(WindowList.ForegroundProcessName(), runTarget, StringComparison.OrdinalIgnoreCase);
             }
 
-            if (phase != Phase.Holding && stopUtc.HasValue && now >= stopUtc.Value)
+            if (userPaused || windowInactive)
+            {
+                if (!paused) PauseRun();
+                UpdateRunStatus(now);
+                return;
+            }
+
+            if (paused) ResumeRun(now);
+
+            if (phase == Phase.Waiting && stopUtc.HasValue && now >= stopUtc.Value)
             {
                 StopRun("Stoppzeit erreicht.");
                 return;
@@ -1134,30 +1589,33 @@ namespace AutoKey
 
                 case Phase.Holding:
                     if (now < releaseUtc) break;
-
-                    Step step = runSteps[stepIndex];
-                    SendUp(step);
+                    SendUp(runSteps[stepIndex]);
                     if (lastPressOk) presses++; // blockierte Eingaben nicht mitzählen
-                    stepIndex++;
+                    FinishStep(now);
+                    break;
 
-                    if (stepIndex < runSteps.Length)
+                case Phase.Typing:
+                    if (now < nextCharUtc) break;
+                    Step text = runSteps[stepIndex];
+                    int consumed = KeySender.TypeCharacter(text.Text, textIndex);
+                    if (consumed == 0)
                     {
-                        phase = Phase.Gap;
-                        gapUntilUtc = now.AddMilliseconds(step.DelayAfterMs);
+                        ReportSendResult(false);
+                        FinishStep(now);
                         break;
                     }
 
-                    // Durchlauf beendet
-                    cycles++;
-                    SetTrayText("AutoKey – läuft (" + Count(runSteps.Length > 1 ? cycles : presses) + "×)");
-                    if (runRepeat > 0 && cycles >= runRepeat)
+                    textIndex += consumed;
+                    if (textIndex >= text.Text.Length)
                     {
-                        StopRun("Fertig.");
-                        return;
+                        presses++;
+                        FinishStep(now);
+                    }
+                    else
+                    {
+                        nextCharUtc = now.AddMilliseconds(Jitter(text.HoldMs));
                     }
 
-                    phase = Phase.Waiting;
-                    notBeforeUtc = now.AddMilliseconds(step.DelayAfterMs);
                     break;
 
                 case Phase.Gap:
@@ -1169,19 +1627,64 @@ namespace AutoKey
         private void StartStep(DateTime now)
         {
             Step step = runSteps[stepIndex];
-            ReportSendResult(SendDown(step));
-            phase = Phase.Holding;
-            releaseUtc = now.AddMilliseconds(step.HoldMs);
+            if (step.UsesMousePosition) KeySender.MoveTo(step.MouseX, step.MouseY);
+
+            switch (step.Type)
+            {
+                case StepType.Text:
+                    textIndex = 0;
+                    nextCharUtc = now;
+                    phase = Phase.Typing;
+                    break;
+
+                case StepType.Wheel:
+                    bool ok = KeySender.Wheel(step.Wheel);
+                    ReportSendResult(ok);
+                    if (ok) presses++;
+                    FinishStep(now);
+                    break;
+
+                default:
+                    ReportSendResult(SendDown(step));
+                    phase = Phase.Holding;
+                    releaseUtc = now.AddMilliseconds(Math.Max(1, Jitter(step.HoldMs)));
+                    break;
+            }
         }
 
-        /// <summary>Zielfenster nicht mehr im Vordergrund: alles loslassen und warten.</summary>
+        /// <summary>Nach einem Schritt: Pause bis zum nächsten oder Durchlauf abschließen.</summary>
+        private void FinishStep(DateTime now)
+        {
+            Step step = runSteps[stepIndex];
+            stepIndex++;
+
+            if (stepIndex < runSteps.Length)
+            {
+                phase = Phase.Gap;
+                gapUntilUtc = now.AddMilliseconds(Jitter(step.DelayAfterMs));
+                return;
+            }
+
+            cycles++;
+            SetTrayText("AutoKey – läuft (" + Count(runSteps.Length > 1 ? cycles : presses) + "×)");
+            if (runRepeat > 0 && cycles >= runRepeat)
+            {
+                StopRun("Fertig.");
+                return;
+            }
+
+            phase = Phase.Waiting;
+            notBeforeUtc = now.AddMilliseconds(Jitter(step.DelayAfterMs));
+        }
+
+        /// <summary>Zielfenster nicht im Vordergrund oder Pause-Taste: alles loslassen und warten.</summary>
         private void PauseRun()
         {
             paused = true;
-            if (phase == Phase.Holding)
+            if (phase == Phase.Holding) SendUp(runSteps[stepIndex]);
+            if (phase == Phase.Holding || phase == Phase.Typing)
             {
-                SendUp(runSteps[stepIndex]);
-                phase = Phase.Gap;               // unterbrochenen Schritt nach dem Fortsetzen wiederholen
+                phase = Phase.Gap;               // unterbrochenen Schritt nach dem Fortsetzen von vorn ausführen
                 gapUntilUtc = DateTime.MinValue;
             }
 
@@ -1225,8 +1728,7 @@ namespace AutoKey
 
         private DateTime ComputeNextDue(DateTime previousDue, DateTime now)
         {
-            double ms = runIntervalMs;
-            if (runJitter > 0) ms *= 1.0 + (random.NextDouble() * 2.0 - 1.0) * runJitter / 100.0;
+            double ms = Jitter(runIntervalMs);
             ms = Math.Max(ms, MinIntervalMs);
 
             // Vom geplanten Zeitpunkt aus rechnen (kein Driften), aber Verpasstes nicht nachholen.
@@ -1234,14 +1736,24 @@ namespace AutoKey
             return next > now ? next : now.AddMilliseconds(ms);
         }
 
+        /// <summary>Wert zufällig um ± „Zufällig variieren“-Prozent verändern.</summary>
+        private double Jitter(double ms)
+        {
+            if (runJitter <= 0 || ms <= 0) return ms;
+            return ms * (1.0 + (random.NextDouble() * 2.0 - 1.0) * runJitter / 100.0);
+        }
+
+        private int Jitter(int ms) => (int)Math.Round(Jitter((double)ms));
+
         private bool SendDown(Step step)
         {
             try
             {
                 return KeySender.Down(step.Key, step.Ctrl, step.Alt, step.Shift, runScanCode);
             }
-            catch (Exception)
+            catch (Exception ex)
             {
+                Log.Error("Taste drücken", ex);
                 return false;
             }
         }
@@ -1252,9 +1764,9 @@ namespace AutoKey
             {
                 KeySender.Up(step.Key, step.Ctrl, step.Alt, step.Shift, runScanCode);
             }
-            catch (Exception)
+            catch (Exception ex)
             {
-                // ignorieren
+                Log.Error("Taste loslassen", ex);
             }
         }
 
@@ -1268,6 +1780,8 @@ namespace AutoKey
 
         private void UpdateRunStatus(DateTime now)
         {
+            SetTitle("AutoKey – läuft " + FormatDuration(now - runStartedUtc) + (userPaused ? " (Pause)" : string.Empty));
+
             if (sendWarning != null && !paused)
             {
                 SetStatus(sendWarning);
@@ -1277,7 +1791,11 @@ namespace AutoKey
             string clickHint = runTarget.Length == 0 ? " Jetzt ins Zielfenster klicken!" : string.Empty;
             string text;
 
-            if (paused)
+            if (userPaused)
+            {
+                text = "Pausiert – weiter mit " + (pauseHotkeyOk ? KeyNames.DescribeCombo(settings.PauseHotkey) : "„Weiter“ im Menü neben der Uhr") + ".";
+            }
+            else if (paused)
             {
                 text = "Pausiert – " + runTarget + ".exe ist nicht im Vordergrund. Es geht automatisch weiter, sobald du dorthin wechselst.";
             }
@@ -1303,7 +1821,7 @@ namespace AutoKey
                 }
                 else
                 {
-                    text = "Läuft – " + Count(presses) + limit + " Tastendrücke – nächster in "
+                    text = "Läuft – " + Count(presses) + limit + " Eingaben – nächste in "
                            + FormatRemaining(Later(nextDueUtc, notBeforeUtc) - now);
                 }
             }
@@ -1339,6 +1857,13 @@ namespace AutoKey
             lblStatus.Text = text;
         }
 
+        private void SetTitle(string text)
+        {
+            if (text == lastTitle) return;
+            lastTitle = text;
+            Text = text;
+        }
+
         private void SetTrayText(string text)
         {
             if (text.Length > 63) text = text.Substring(0, 63); // Windows-Grenze für Tooltips im Infobereich
@@ -1352,21 +1877,48 @@ namespace AutoKey
             if (chkNotify.Checked) tray.ShowBalloonTip(4000, "AutoKey", text, ToolTipIcon.Info);
         }
 
+        /// <summary>Kurze Tonfolge (Frequenz, Dauer, …) im Hintergrund abspielen.</summary>
+        private void Tone(int[] pattern)
+        {
+            if (!chkBeep.Checked) return;
+            ThreadPool.QueueUserWorkItem(_ =>
+            {
+                try
+                {
+                    for (int i = 0; i + 1 < pattern.Length; i += 2) Console.Beep(pattern[i], pattern[i + 1]);
+                }
+                catch (Exception)
+                {
+                    // kein Lautsprecher – egal
+                }
+            });
+        }
+
         private void Warn(string message) =>
             MessageBox.Show(this, message, "AutoKey", MessageBoxButtons.OK, MessageBoxIcon.Warning);
 
         private void ShowAbout()
         {
             MessageBox.Show(
-                "AutoKey " + AppVersion + "\n\n"
-                + "Drückt automatisch Tasten und Maustasten – einzeln oder als Ablauf, in festen Abständen, "
+                "AutoKey " + AppVersion + (Settings.IsPortable ? " (portabel)" : string.Empty) + "\n\n"
+                + "Drückt automatisch Tasten und Maustasten – aufgezeichnet oder als Ablauf, in festen Abständen, "
                 + "zu einer bestimmten Uhrzeit oder dauerhaft gehalten.\n\n"
-                + "Einstellungen und Profile werden gespeichert in:\n" + Settings.BaseDirectory + "\n\n"
-                + "Startoptionen:\n  /start  – sofort mit den gespeicherten Einstellungen loslegen\n  /tray   – unsichtbar im Infobereich starten",
+                + "Einstellungen, Profile und Fehlerprotokoll liegen in:\n" + Settings.BaseDirectory + "\n\n"
+                + "Startoptionen:\n"
+                + "  /start            – sofort mit den gespeicherten Einstellungen loslegen\n"
+                + "  /tray             – unsichtbar im Infobereich starten\n"
+                + "  /profile:Name     – dieses Profil laden",
                 "Über AutoKey", MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
 
         // ------------------------------------------------------------------ Fenster / Infobereich
+
+        /// <summary>Wird aufgerufen, wenn AutoKey ein zweites Mal gestartet wurde.</summary>
+        public void ShowFromOtherInstance()
+        {
+            RestoreFromTray();
+            if (!running) SetStatus("AutoKey läuft bereits – hier ist das Fenster.");
+        }
 
         protected override void OnShown(EventArgs e)
         {
@@ -1399,6 +1951,12 @@ namespace AutoKey
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
             closing = true;
+            if (recorder != null)
+            {
+                recorder.Dispose();
+                recorder = null;
+            }
+
             StopRun("Beendet.");
             OnEditorChanged();
             ReadSettingsFromUi();
@@ -1411,6 +1969,8 @@ namespace AutoKey
             if (disposing)
             {
                 timer.Dispose();
+                pickTimer.Dispose();
+                tips.Dispose();
                 if (tray != null)
                 {
                     tray.Visible = false;

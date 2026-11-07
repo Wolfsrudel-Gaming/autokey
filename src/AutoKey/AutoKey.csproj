@@ -15,11 +15,11 @@
     <DebugType>none</DebugType>
     <GenerateDocumentationFile>false</GenerateDocumentationFile>
 
-    <Version>1.1.0</Version>
+    <Version>1.2.0</Version>
     <Product>AutoKey</Product>
     <AssemblyTitle>AutoKey</AssemblyTitle>
     <Company>Wolfsrudel Gaming</Company>
-    <Description>Drückt automatisch Tasten und Maustasten – einzeln oder als Ablauf, nach Zeitplan oder dauerhaft gehalten.</Description>
+    <Description>Drückt automatisch Tasten und Maustasten – aufgezeichnet oder als Ablauf, nach Zeitplan oder dauerhaft gehalten.</Description>
     <Copyright>© 2026 Wolfsrudel Gaming</Copyright>
   </PropertyGroup>
 

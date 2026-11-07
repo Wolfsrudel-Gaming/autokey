@@ -3,16 +3,20 @@ using System.Runtime.InteropServices;
 
 namespace AutoKey
 {
-    /// <summary>Win32-Funktionen für Tastatureingaben, globale Hotkeys und Energiesparmodus.</summary>
+    /// <summary>Win32-Funktionen für Eingaben, globale Hotkeys, Aufzeichnung und Energiesparmodus.</summary>
     internal static class NativeMethods
     {
         public const int WM_HOTKEY = 0x0312;
+        public const uint MOD_ALT = 0x0001;
+        public const uint MOD_CONTROL = 0x0002;
+        public const uint MOD_SHIFT = 0x0004;
         public const uint MOD_NOREPEAT = 0x4000;
 
         public const uint INPUT_MOUSE = 0;
         public const uint INPUT_KEYBOARD = 1;
         public const uint KEYEVENTF_EXTENDEDKEY = 0x0001;
         public const uint KEYEVENTF_KEYUP = 0x0002;
+        public const uint KEYEVENTF_UNICODE = 0x0004;
         public const uint KEYEVENTF_SCANCODE = 0x0008;
 
         public const uint MOUSEEVENTF_LEFTDOWN = 0x0002;
@@ -23,16 +27,39 @@ namespace AutoKey
         public const uint MOUSEEVENTF_MIDDLEUP = 0x0040;
         public const uint MOUSEEVENTF_XDOWN = 0x0080;
         public const uint MOUSEEVENTF_XUP = 0x0100;
+        public const uint MOUSEEVENTF_WHEEL = 0x0800;
         public const uint XBUTTON1 = 0x0001;
         public const uint XBUTTON2 = 0x0002;
+        public const int WHEEL_DELTA = 120;
 
         public const uint MAPVK_VK_TO_VSC = 0;
         public const uint MAPVK_VK_TO_CHAR = 2;
         public const uint MAPVK_VK_TO_VSC_EX = 4;
 
+        // Low-Level-Hooks (Aufzeichnung)
+        public const int WH_KEYBOARD_LL = 13;
+        public const int WH_MOUSE_LL = 14;
+        public const int WM_KEYDOWN = 0x0100;
+        public const int WM_KEYUP = 0x0101;
+        public const int WM_SYSKEYDOWN = 0x0104;
+        public const int WM_SYSKEYUP = 0x0105;
+        public const int WM_LBUTTONDOWN = 0x0201;
+        public const int WM_LBUTTONUP = 0x0202;
+        public const int WM_RBUTTONDOWN = 0x0204;
+        public const int WM_RBUTTONUP = 0x0205;
+        public const int WM_MBUTTONDOWN = 0x0207;
+        public const int WM_MBUTTONUP = 0x0208;
+        public const int WM_MOUSEWHEEL = 0x020A;
+        public const int WM_XBUTTONDOWN = 0x020B;
+        public const int WM_XBUTTONUP = 0x020C;
+        public const uint LLKHF_INJECTED = 0x00000010;
+        public const uint LLMHF_INJECTED = 0x00000001;
+
         private const uint ES_CONTINUOUS = 0x80000000;
         private const uint ES_SYSTEM_REQUIRED = 0x00000001;
         private const uint ES_DISPLAY_REQUIRED = 0x00000002;
+
+        public delegate IntPtr HookProc(int nCode, IntPtr wParam, IntPtr lParam);
 
         [StructLayout(LayoutKind.Sequential)]
         public struct INPUT
@@ -78,6 +105,33 @@ namespace AutoKey
             public ushort wParamH;
         }
 
+        [StructLayout(LayoutKind.Sequential)]
+        public struct POINT
+        {
+            public int x;
+            public int y;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct KBDLLHOOKSTRUCT
+        {
+            public uint vkCode;
+            public uint scanCode;
+            public uint flags;
+            public uint time;
+            public UIntPtr dwExtraInfo;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct MSLLHOOKSTRUCT
+        {
+            public POINT pt;
+            public uint mouseData;
+            public uint flags;
+            public uint time;
+            public UIntPtr dwExtraInfo;
+        }
+
         [DllImport("user32.dll", SetLastError = true)]
         public static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
 
@@ -100,10 +154,33 @@ namespace AutoKey
 
         [DllImport("user32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool SetCursorPos(int x, int y);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
         public static extern bool DestroyIcon(IntPtr hIcon);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern IntPtr SetWindowsHookEx(int idHook, HookProc lpfn, IntPtr hMod, uint dwThreadId);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool UnhookWindowsHookEx(IntPtr hhk);
+
+        [DllImport("user32.dll")]
+        public static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern IntPtr GetModuleHandle(string lpModuleName);
 
         [DllImport("kernel32.dll")]
         private static extern uint SetThreadExecutionState(uint esFlags);
+
+        [DllImport("winmm.dll")]
+        private static extern uint timeBeginPeriod(uint uPeriod);
+
+        [DllImport("winmm.dll")]
+        private static extern uint timeEndPeriod(uint uPeriod);
 
         /// <summary>Verhindert (oder erlaubt wieder) Standby und Abschalten des Bildschirms.</summary>
         public static void PreventSleep(bool prevent)
@@ -117,6 +194,23 @@ namespace AutoKey
             catch (Exception)
             {
                 // Nicht kritisch – Standby wird dann eben nicht verhindert.
+            }
+        }
+
+        /// <summary>
+        /// Erhöht die Zeitauflösung von Windows auf 1 ms, damit kurze Haltedauern und Abstände
+        /// genau eingehalten werden (Standard sind ca. 15 ms).
+        /// </summary>
+        public static void HighTimerResolution(bool enable)
+        {
+            try
+            {
+                if (enable) timeBeginPeriod(1);
+                else timeEndPeriod(1);
+            }
+            catch (Exception)
+            {
+                // Nicht kritisch – dann gilt die Standardauflösung.
             }
         }
     }

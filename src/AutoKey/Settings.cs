@@ -43,7 +43,13 @@ namespace AutoKey
         public TimeSpan StopTime = new TimeSpan(18, 0, 0);
 
         // ---- Allgemein
+        /// <summary>Start/Stopp-Taste inkl. Zusatztasten-Bits (z. B. Keys.Control | Keys.F6).</summary>
         public Keys Hotkey = Keys.F6;
+
+        /// <summary>Pause/Weiter-Taste; Keys.None = keine.</summary>
+        public Keys PauseHotkey = Keys.None;
+
+        public bool Beep = true;
         public bool TopMost;
         public bool MinimizeToTray = true;
         public bool HideOnStart;
@@ -51,8 +57,39 @@ namespace AutoKey
         public bool PreventSleep = true;
         public string Profile = string.Empty;
 
-        public static string BaseDirectory =>
-            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "AutoKey");
+        private static string baseDirectory;
+
+        /// <summary>
+        /// Einstellungsordner: normalerweise %APPDATA%\AutoKey. Liegt neben der AutoKey.exe eine Datei
+        /// „portable.txt“, werden Einstellungen und Profile stattdessen neben der EXE gespeichert (USB-Stick).
+        /// </summary>
+        public static string BaseDirectory
+        {
+            get
+            {
+                if (baseDirectory == null)
+                {
+                    try
+                    {
+                        string exeDir = Path.GetDirectoryName(Application.ExecutablePath);
+                        if (exeDir != null && File.Exists(Path.Combine(exeDir, "portable.txt")))
+                            baseDirectory = exeDir;
+                    }
+                    catch (Exception)
+                    {
+                        // dann AppData
+                    }
+
+                    if (baseDirectory == null)
+                        baseDirectory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "AutoKey");
+                }
+
+                return baseDirectory;
+            }
+        }
+
+        public static bool IsPortable => !BaseDirectory.StartsWith(
+            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), StringComparison.OrdinalIgnoreCase);
 
         public static string FilePath => Path.Combine(BaseDirectory, "settings.ini");
 
@@ -202,6 +239,8 @@ namespace AutoKey
                 "StopAtTime=" + Bool(StopAtTime),
                 "StopTime=" + StopTime.ToString(TimeFormat, CultureInfo.InvariantCulture),
                 "Hotkey=" + (int)Hotkey,
+                "PauseHotkey=" + (int)PauseHotkey,
+                "Beep=" + Bool(Beep),
                 "TopMost=" + Bool(TopMost),
                 "MinimizeToTray=" + Bool(MinimizeToTray),
                 "HideOnStart=" + Bool(HideOnStart),
@@ -256,7 +295,9 @@ namespace AutoKey
                 case "StartTime": StartTime = ParseTime(value, StartTime); break;
                 case "StopAtTime": StopAtTime = ParseBool(value, StopAtTime); break;
                 case "StopTime": StopTime = ParseTime(value, StopTime); break;
-                case "Hotkey": Hotkey = ParseKey(value, Hotkey); break;
+                case "Hotkey": Hotkey = ParseHotkey(value, Hotkey); break;
+                case "PauseHotkey": PauseHotkey = ParseHotkey(value, PauseHotkey); break;
+                case "Beep": Beep = ParseBool(value, Beep); break;
                 case "TopMost": TopMost = ParseBool(value, TopMost); break;
                 case "MinimizeToTray": MinimizeToTray = ParseBool(value, MinimizeToTray); break;
                 case "HideOnStart": HideOnStart = ParseBool(value, HideOnStart); break;
@@ -280,6 +321,17 @@ namespace AutoKey
         {
             int code = ParseInt(value, -1);
             return code > 0 && code < 256 ? (Keys)code : fallback;
+        }
+
+        /// <summary>Taste inkl. Strg/Alt/Shift-Bits; 0 = keine.</summary>
+        private static Keys ParseHotkey(string value, Keys fallback)
+        {
+            int code = ParseInt(value, -1);
+            if (code < 0) return fallback;
+            var keys = (Keys)code;
+            if ((keys & ~(Keys.KeyCode | Keys.Control | Keys.Alt | Keys.Shift)) != 0) return fallback;
+            int vk = (int)(keys & Keys.KeyCode);
+            return vk == 0 ? Keys.None : vk < 256 ? keys : fallback;
         }
 
         private static TimeSpan ParseTime(string value, TimeSpan fallback) =>
